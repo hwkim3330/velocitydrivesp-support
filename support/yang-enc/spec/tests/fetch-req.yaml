@@ -1,0 +1,6 @@
+# Copyright (c) 2021-2022 Microchip Technology Inc. and its subsidiaries.
+# SPDX-License-Identifier: MIT
+
+---
+- "/ieee802-dot1q-bridge:bridges/bridge[name='b0']/component[name='c0']/filtering-database/vlan-registration-entry[database-id='0'][vids='1']/port-map[port-ref='1']/static-vlan-registration-entries/vlan-transmitted"
+- "/ieee802-dot1q-bridge:bridges/bridge[name='b0']/component[name='c0']/filtering-database/vlan-registration-entry[database-id='0'][vids='1']/port-map[port-ref='1']"

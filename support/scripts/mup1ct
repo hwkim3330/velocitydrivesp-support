@@ -1,0 +1,1577 @@
+#!/usr/bin/env ruby
+
+# Copyright (c) 2021-2022 Microchip Technology Inc. and its subsidiaries.
+# SPDX-License-Identifier: MIT
+
+require 'optparse'
+require 'bit-struct'
+require 'open3'
+require 'socket'
+require 'cbor-pure'
+require 'uri'
+require 'base64'
+require 'shellwords'
+require "nokogiri"
+
+USAGE = <<-USAGE
+mup1ct - Microchip UART Protocol 1 client tool
+
+This tool may be used to connect to UART terminal servers, and inject/extract
+MUP1 packets. This only make sense if the connected device talk the MUP1
+protocol.
+
+The tool is designed to ease integration with other tool which can encode or
+decode the relevant CoAP messages. To facilitate this, all non-data is printed
+STDERR (this includes meta data, traces, errors etc).
+
+A common use-case is to do a CoAP/CORECONF get operation, and then use cbor-diag
+to decode the message like this:
+  mup1ct -d termhub://10.0.0.2:4000 -t coap get c/Bty | cbor-diag --from bytes
+
+To help generate the URL-PATH (Bty in above) you can use sid_encode that takes the destination SID as parameter.
+  mup1ct -d termhub://10.205.27.91:4112 coap get c/`sid_encode 7026` | cbor-diag
+
+An easier way to provide is to use the cc command. Then the elements that make 
+up the URL can be specified as human-readable parameters.
+  mup1ct -d termhub://10.205.27.91:4112 coap get --ds c --sid 7026 
+    --keys s:b0,s:c0,i:0,i:1 --flags c=n,d=a | cbor-diag
+
+Usage:
+  mup1ct [options] ping
+  mup1ct [options] coap (get|put|del|post) <URL-PATH> [--content-type <NUM>] [--accept <NUM>]
+  mup1ct [options] cc (get|put|del|post|fetch|ipatch) [--content-type <NUM>] [--accept <NUM>]
+                                                      [--ds <DS>] --sid <SID> [--keys <type:val>[,...]] [--flags <FF>]
+  mup1ct [options] sysrq stack-usage-every <N>
+  mup1ct [options] sysrq stack-usage-once
+  mup1ct [options] sysrq trace <TRACE-SPECIFIER>
+  mup1ct [options] sysrq dump <DUMP-SPECIFIER>
+  mup1ct [options] listen
+
+Options:
+  -h --help                  Show this screen.
+  -d --device <URL>          IP based terminal device to connect to.
+                             Ex: termhub://10.0.0.2:4000
+  -i --input <FILE>          Read COAP PAYLOAD data from <FILE> instead of STDIN.
+  -o --output <FILE>         Write output to <FILE> instead of STDOUT
+  -w <VAL>                   How long to wait for responses (in seconds but it
+                             may be a floating point number). A value of '-1'
+                             means forever.
+                             Default value is 1 when used with ping/sysrq
+                             Default value assure two retrans when used with coap
+                             Default value is -1 if used with listen.
+  -t --trace                 Any traces received while performing the command
+                             shall be printed on STDERR.
+  -T --trace-timeout <VAL>   Same as the '-t' option, but when used here, the
+                             tool shall wait for <VAL> seconds after the request
+                             has completed to see if more traces are issued.
+                             If <VAL> is a negative number, then any traces
+                             received will reset the timer, if it is positive
+                             then it is an absolute time.
+
+Command details:
+  mup1ct [options] ping
+    Shall issue a mup1 ping request and if a response is received within the
+    timeout it shall write 'PONG in XX ms' on the screen and return '0'. If no
+    response is received it shall 'NO-PONG' and return '1'.
+
+  mup1ct [options] coap (get|put|del|post) <URL-PATH> <PAYLOAD>
+    Perform a coap request (either get, put, del or post) and add an option
+    with the 'uri-path'.
+
+    If the CoAP payload in either direction is bigger than 128 bytes, then
+    blockwise transfers shall be used using a block size of 128 bytes.
+
+    If a response is received (success or error), then the response code shall be
+    printed at STDERR using the format:
+      RESPONSE-CODE: <3-digt-code> <texttual response code>
+    Example:
+      RESPONSE-CODE: 201 Created
+
+    If PAYLOAD data can be read from STDIN, or if the '-i' option is given, then this
+    data shall be included in the request message as payload.
+
+    If any payload is returned it shall be written at STDOUT unless the '-o'
+    option is provided.
+
+    Parameters:
+      --content-type The value to be used in the CoAP Content-Format option (default depends on the coap request).
+                     See https://www.iana.org/assignments/core-parameters/core-parameters.xhtml#content-formats
+                     Use a negative value to exclude the Content-Format option from the CoAP request.
+
+      --accept       The value to be used in the CoAP Accept option (default depends on the coap request).
+                     See https://www.iana.org/assignments/core-parameters/core-parameters.xhtml#content-formats
+                     Use a negative value to exclude the Accept option from the CoAP request.
+
+  mup1ct [options] cc (get|put|del|post|fetch|ipatch) --ds <DS> --sid <SID> [--keys <type:val> ...] [--flags <DD> ...]
+    Perform a coap request (either get, put, del, post, fetch or ipatch). Parameters are given unencoded in "plain text".
+
+    If the CoAP payload in either direction is bigger than 128 bytes, then
+    blockwise transfers shall be used using a block size of 128 bytes.
+
+    If a response is received (success or error), then the response code shall be printed at STDERR using the format:
+      RESPONSE-CODE: <3-digt-code> <texttual response code>
+    Example:
+      RESPONSE-CODE: 201 Created
+
+    If PAYLOAD data can be read from STDIN, or if the '-i' option is given, then this data shall be included in the
+    request message as payload.
+
+    If any payload is returned it shall be written at STDOUT unless the '-o'
+    option is provided.
+
+    Parameters:
+      --content-type The value to be used in the CoAP Content-Format option (default depends on the coap request).
+                     See https://www.iana.org/assignments/core-parameters/core-parameters.xhtml#content-formats
+                     Use a negative value to exclude the Content-Format option from the CoAP request.
+
+      --accept       The value to be used in the CoAP Accept option (default depends on the coap request).
+                     See https://www.iana.org/assignments/core-parameters/core-parameters.xhtml#content-formats
+                     Use a negative value to exclude the Accept option from the CoAP request.
+
+      --ds    Denotes the datastore to be accessed. If the paramter is 
+              not present, the default datastore is '/c'.
+
+      --sid   The SID to be adressed is given as decimal number.     
+
+      --keys  Query parameter for instance identifier keys
+              Query parameters consist of type and value, which are separated by ':'. Several keys can be concatenated by ','. 
+              Possible types are:
+                s     string value, without quotes 
+                      (e.g. --key s:b0 or --key s:192.168.0.45 or --key s:01-02-03-04-05-06)
+                i     integer value 
+                      (e.g. --key i:1234 or --key i:-5)
+                b     boolean, possible values: true, false
+                      (e.g. --key b:true)
+
+      --flags c and d query parameters. CORECONF allows one c and one d query 
+              each. They are concatenated by ','. 
+              Possible values are:
+                c=c
+                c=n
+                c=a
+                d=a
+                d=t 
+
+
+  mup1ct [options] sysrq trace <TRACE-SPECIFIER>[,<TRACE-SPECIFIER>...]
+    This is used to set a trace level, where <TRACE-SPECIFIER> is defined as:
+      <MODULE>:<LEVEL>
+
+      Where:
+        <MODULE>: Is the name of a given module. An "empty string" may be used as an alias
+                  for all modules.
+        <LEVEL>:  Can be specified as one of: 'off', 'error', 'info', 'debug',
+                  'noise', 'get'.
+                  Here 'get' is special as it will trigger the given trace level
+                  to be printed as a MUP1-Trace message.
+                  All other will cause an update of the trace level.
+                  Default value is 'get'
+    If multiple trace-specifier are given, then they will be evaluated in
+    sequence.
+
+    Example:
+      mup1ct -t sysrq trace : # Print all trace levels
+      mup1ct -t sysrq trace :off # Disable all traces
+      mup1ct -t sysrq trace port:info # Set trace level in 'port' to info level
+
+  mup1ct [options] sysrq dump <DUMP-SPECIFIER>
+    This is used to show switch/PHY state, where <DUMP-SPECIFIER> is defined as:
+      <LAYER>:<GROUP>:<PORT-LIST>:<FLAGS>
+
+      Where:
+        <LAYER>    : Layer, use 'ail' or 'cil' (default is both layers).
+        <GROUP>    : Group, use 'get' to see groups (default is all groups).
+        <PORT-LIST>: Port list, for example '0,2-5' (default is all ports).
+        <FLAGS>    : Flags, 'full' and 'clear' may be used.
+
+    Examples (abbreviated layer/group/flags are used):
+      mup1ct sysrq dump           : Dump all switch state
+      mup1ct sysrq dump a:c       : Dump AIL switch counters for all ports
+      mup1ct sysrq dump c:c:1,3   : Dump CIL switch counters for port 1 and 3
+      mup1ct sysrq dump a:c:1:f   : Dump AIL detailed switch counters for port 1
+
+  mup1ct [options] listen
+    This command will not issue any requests, but simply listen to the UART line
+    and if used in combination with '-t' then it shall print traces.
+    Notice the default "waiting" ('-w') time here is infinite.
+USAGE
+
+def sid_encode sid
+  base64_urlsafe = [
+    'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P',
+    'Q','R','S','T','U','V','W','X','Y','Z','a','b','c','d','e','f',
+    'g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v',
+    'w','x','y','z','0','1','2','3','4','5','6','7','8','9','-','_']
+
+  buf = ""
+  save = false
+  i = 60
+  j = 0
+  n = 0
+  while i >= 0 do
+      n = (sid.to_i >> i) & 0x3f
+      if (n != 0)
+          save = true # Start saving after first non zero data
+      end
+      if (save)
+          buf = buf + base64_urlsafe[n]
+      end
+      i -= 6
+  end
+  return buf
+end
+
+
+COAP_CODE_PING = 0
+COAP_CODE_GET = 1
+COAP_CODE_POST = 2
+COAP_CODE_PUT = 3
+COAP_CODE_DEL = 4
+COAP_CODE_FETCH = 5
+COAP_CODE_IPATCH = 7
+
+COAP_FORMAT_UNSPECIFIED                =  -1
+COAP_FORMAT_TEXT_PLAIN                 =   0
+COAP_FORMAT_APPL_LINK                  =  40
+COAP_FORMAT_APPL_XML                   =  41
+COAP_FORMAT_APPL_JSON                  =  50
+COAP_FORMAT_APPL_CBOR                  =  60
+COAP_FORMAT_APPL_YANG_DATA_CBOR        = 140
+COAP_FORMAT_APPL_YANG_IDENTIFIERS_CBOR = 141
+COAP_FORMAT_APPL_YANG_INSTANCES_CBOR   = 142
+
+COAP_TYPE_CONFIRMABLE = 0
+COAP_TYPE_NON_CONFIRMABLE = 1
+COAP_TYPE_ACK = 2
+COAP_TYPE_RESET = 3
+
+COAP_OPT_IF_MATCH       =  1 # opaque (not implemented)
+COAP_OPT_URI_HOST       =  3 # string (not implemented)
+COAP_OPT_ETAG           =  4 # opaque (not implemented)
+COAP_OPT_IF_NONE_MATCH  =  5 # empty (not implemented)
+COAP_OPT_URI_PORT       =  7 # uint (not implemented)
+COAP_OPT_LOCATION_PATH  =  8 # string (not implemented)
+COAP_OPT_URI_PATH       = 11 # string
+COAP_OPT_CONTENT_FORMAT = 12 # uint
+COAP_OPT_MAX_AGE        = 14 # uint (not implemented)
+COAP_OPT_URI_QUERY      = 15 # string
+COAP_OPT_ACCEPT         = 17 # uint
+COAP_OPT_LOCATION_QUERY = 20 # string (not implemented)
+COAP_OPT_BLOCK2         = 23 # Block2
+COAP_OPT_BLOCK1         = 27 # Block1
+
+COAP_OPT_PROXY_URI      = 35 # string (not implemented)
+COAP_OPT_PROXY_SCHEME   = 39 # string (not implemented)
+COAP_OPT_SIZE1          = 60 # uint (not implemented)
+
+COAP_ACK_WAIT_TIME = 1       # Wait for ACK in one second then retransmit
+COAP_LAST_ACK_WAIT_TIME = 5  # Wait for the last ACK
+
+SYM_SOF = 0x3e
+SYM_EOF = 0x3c
+SYM_ESC = 0x5c
+SYM_NL  = 0x0d
+SYM_00  = 0x30
+SYM_FF  = 0x46
+
+if ARGV.size == 0
+    puts "No command specified!"
+    puts
+    puts USAGE
+    exit 0
+end
+
+$opt = {}
+$cc_opt = {:keys => [], :flags => [], :datastore => "c"}
+
+OptionParser.new do |opts|
+    opts.banner = "Usage: #{$0}"
+
+    opts.on("-h", "--help", "The MUP1CT help") do |h|
+        $opt[:help] = h
+    end
+
+    opts.on("-d", "--device <URL>", "The device terminal URL") do |d|
+        $opt[:device] = d
+    end
+
+    opts.on("-i", "--input <FILE>", "Read data from <FILE>") do |i|
+        $opt[:input] = i
+    end
+
+    opts.on("-o", "--output <FILE>", "Write output to <FILE>") do |o|
+        $opt[:output] = o
+    end
+
+    opts.on("-w", "--wait <VAL>", "Response wait time") do |w|
+        $opt[:wait] = w
+    end
+
+    opts.on("-t", "--trace", "Print all trace") do |t|
+        $opt[:trace] = t
+    end
+
+    opts.on("-T", "--Trace <WAIT-TIME>", "Print trace in a specific time") do |tw|
+        $opt[:Trace] = tw
+    end
+
+    opts.on("--ds <DS>", "Datastore to be accessed" ) do |ds|
+        $cc_opt[:datastore] = ds   
+    end
+
+    opts.on("--sid <SID>", "SID to be adressed" ) do |a|
+        $cc_opt[:sid] = a
+    end
+
+    opts.on("--content-type <NUM>", "Content type of payload" ) do |ct|
+        $cc_opt[:content_type] = ct.to_i
+    end
+
+    opts.on("--accept <NUM>", "Expected content type of response" ) do |ct|
+        $cc_opt[:accept] = ct.to_i
+    end
+
+    opts.on("--keys <KEY>", "Instance identifier keys" ) do |k|
+        $cc_opt[:keys] = k.split(",")   
+    end
+
+    opts.on("--flags <FLAG>", "c and d queries" ) do |f|
+        $cc_opt[:flags] = f.split(",")   
+    end
+
+end.parse!
+
+if !$opt[:help].nil?
+  puts "#{USAGE}"
+  exit 0
+end
+
+if $opt[:device].nil?
+  if (File.exist?('.mscc-libeasy-topology.yaml'))
+      conf = YAML.load_file ".mscc-libeasy-topology.yaml"
+  else
+      conf = YAML.load_file "#{ENV["HOME"]}/.mscc-libeasy-topology.yaml"
+  end
+  $device = conf["dut"]["terminal"]
+else
+  $device = $opt[:device]
+end
+
+commands = ["cc", "coap", "sysrq", "listen", "ping"]
+$cmd = ARGV.shift
+if !commands.include?($cmd)
+    puts "command is invalid"
+    exit -1
+end
+
+$input = nil
+if !$opt[:input].nil?
+    if !File.exist?($opt[:input])
+        puts "File does not exist"
+        exit -1
+    end
+    file = File.open($opt[:input])
+    file.binmode
+    $input = file.read
+    file.close
+end
+
+$stdin.binmode
+$stdout.binmode
+
+if ($cmd == "coap")
+    $coap_method = ARGV.shift
+    if !["get", "put", "post", "del"].include?($coap_method)
+        puts "coap method invalid"
+        exit -1
+    end
+    if (ARGV.size == 0)
+        puts "The coap URL is missing"
+        exit -1
+    end
+    coap_url = ARGV.shift
+    coap_url_split = coap_url.split('?')
+    if (!coap_url_split[0].nil?)
+        $coap_url_paths = coap_url_split[0].split('/')
+    end
+    if (!coap_url_split[1].nil?)
+        $coap_url_keys = coap_url_split[1].split('&')
+    end
+    if !$input.nil?
+        $coap_payload = $input
+    else if !STDIN.tty?
+        $coap_payload = STDIN.read
+    else if (ARGV.size != 0)
+        $coap_payload = ARGV.shift
+    end
+    end
+    end
+end
+
+if ($cmd == "cc")
+  $cc_method = ARGV.shift
+  if !["get", "put", "post", "del", "fetch", "ipatch"].include?($cc_method)
+    puts "cc method invalid"
+    exit -1
+  end
+
+  # TODO
+  if (ARGV.size == 0)
+    #puts "The cc arguments are missing"
+    #exit -1
+  end
+  # read the rest of ARGV
+
+  # A missing SID indicates a datastore operation
+  if !$cc_opt[:sid].nil?
+    if !["get", "put", "post", "del"].include?($cc_method)
+      puts ("Option --sid is not valid in #{$cc_method} command.")
+      exit -1
+    end
+    # SID: number or symbolic name?
+    s = $cc_opt[:sid]
+    if (s =~ /\b\d/) != nil
+      $stderr.puts "MUP1CT SID num #{s}"
+    elsif (s =~ /\b[a-zA-Z\/][a-zA-Z\/:-]*/) != nil
+      $stderr.puts "MUP1CT SID name #{s}"
+      doc = File.open("../docs/sids.xml") { |f| Nokogiri::XML(f) }
+      n = doc.xpath("/yang-objs/obj[@full_path=\"#{s}\"]/@sid").first
+      if n != nil
+        n = n.value
+        $cc_opt[:sid] = n
+      else
+        puts ("SID not found.")
+        exit -1
+      end
+    elsif
+      puts "invalid SID"
+      exit -1
+    end
+    $stderr.puts "MUP1CT SID #{$cc_opt[:sid]} -> #{sid_encode($cc_opt[:sid])}"
+  end
+
+  # key queries 
+  $keys_diag = []
+  if (!$cc_opt[:keys].empty?)
+    if !["get", "put", "post", "del"].include?($cc_method)
+      puts ("Option --keys is not valid in #{$cc_method} command.")
+      exit -1
+    end
+    $cc_opt[:keys].each do |key|
+      key.strip!
+      case key
+      when /^(s):(.+)/
+        $keys_diag << "\"#{Shellwords.escape(%Q[#{$2}])}\""
+      when /^(i):([+-]?[0-9]+)/
+        $keys_diag << $2.to_i
+      when /^(b):(true|false)/
+        $keys_diag << $2
+      else 
+        puts "Wrong instance identifier key #{key}"
+        exit -1
+      end
+    end
+  end
+
+  # flags array[2], check for double 
+  $flags_diag = []
+  c_exist = false
+  d_exist = false
+  if (!$cc_opt[:flags].empty?)
+    if !["get", "fetch"].include?($cc_method)
+      puts ("Option --flags not valid in #{$cc_method} command.")
+      exit -1
+    end
+    $cc_opt[:flags].each do |flag| 
+      $stderr.puts "MUP1CT flags #{flag}"
+      case flag
+      when /c=[c,n,a]/
+        if (c_exist == true)
+          puts "double c query"
+          exit -1
+        end
+        c_exist = true
+        $flags_diag << flag
+      when /d=[a,t]/
+        if (d_exist == true)
+          puts "double d query"
+          exit -1
+        end
+        d_exist = true
+        $flags_diag << flag
+      else
+        puts "Wrong c and/or d query"
+        exit -1
+      end
+    end
+  end
+
+  if !$input.nil?
+    $coap_payload = $input
+  else if !STDIN.tty?
+    $coap_payload = STDIN.read
+  else if (ARGV.size != 0)
+    $coap_payload = ARGV.shift
+  end
+  end
+  end
+
+end 
+
+$output_file = nil
+if !$opt[:output].nil?
+    #puts "--output Not supported"
+    $output_file = File.open($opt[:output], "w")
+end
+
+if !$opt[:trace].nil? && !$opt[:Trace].nil?
+    puts "Both -t and -T cannot be specified"
+    exit -1
+end
+
+coap_op = ($cmd == "coap" || $cmd == "cc")
+if ($cmd == "listen")
+    $response_wait = -1
+else
+if (coap_op)
+    $response_wait = (3 * COAP_ACK_WAIT_TIME)
+else
+    $response_wait = 1
+end
+end
+
+if !$opt[:wait].nil?
+    # Wait option overwrite default
+    if ($opt[:wait].to_i > $response_wait)
+        # The response wait time can only be increased
+        $response_wait = $opt[:wait].to_i
+    end
+end
+$responce_wait_forever = ($response_wait.to_i < 0) ? true : false
+$response_wait = $response_wait.to_i.abs()
+
+$trace_wait = 0
+$trace = false
+$trace_restart = false
+if !$opt[:trace].nil?
+    $trace = true
+end
+if !$opt[:Trace].nil?
+    $trace = true
+    $trace_restart = ($opt[:Trace].to_i < 0) ? true : false
+    $trace_wait = $opt[:Trace].to_i.abs()
+end
+
+if ($cmd == "sysrq")
+    case ARGV.shift
+    when "trace"
+        if (ARGV.size != 0)
+            $sys_trace_args = ARGV.shift
+            $sys_trace = true
+        end
+    when "dump"
+        $sys_dump_args = (ARGV.size == 0 ? "" : ARGV.shift)
+        $sys_dump = true
+        $trace = true
+    else
+    end
+end
+
+$blok1_size = 256
+$blok2_size = 256
+$pl_split = []
+
+#puts "$responce_wait_forever #{$responce_wait_forever}  $response_wait #{$response_wait}"
+#puts "$trace_restart #{$trace_restart}  $trace_wait #{$trace_wait}"
+#puts "Parse of parameters done"
+
+def cpap_opt_val_enc v
+  if v < 13
+    return v, ""
+  elsif v <= 268
+    v -= 13
+    return 13, [v].pack("C")
+  elsif v < 65536
+    v -= 269
+    return 14, [v].pack("n")
+  else
+    raise "Invalid value"
+  end
+end
+
+def coap_opt_uint_enc v
+  if v == 0
+    return ""
+  elsif v < 256
+    [v].pack("C")
+  elsif v < 65536
+    [v].pack("n")
+  elsif v < 16777216
+    [v].pack("N")[1..3]
+  else
+    [v].pack("N")
+  end
+end
+
+def coap_opt_uint_dec v
+  case v.size
+  when 0
+    v.unshift(0, 0, 0, 0)
+  when 1
+    v.unshift(0, 0, 0)
+  when 2
+    v.unshift(0, 0)
+  when 3
+    v.unshift(0)
+  when 4
+    # do nothing
+  else
+    raise "unexpected size"
+  end
+
+  return v.pack("C*").unpack("N").first
+end
+
+def coap_opt_block_enc num, m, block_size
+  szx = 0
+  case block_size
+  when 16
+    szx = 0
+  when 32
+    szx = 1
+  when 64
+    szx = 2
+  when 128
+    szx = 3
+  when 256
+    szx = 4
+  when 512
+    szx = 5
+  when 1024
+    szx = 6
+  else
+    raise "invalid block size"
+  end
+
+  val = szx
+  if m != 0
+    val += 8
+  end
+
+  val += (num << 4)
+
+  return coap_opt_uint_enc val
+end
+
+def coap_opt_block_dec arr
+  val = coap_opt_uint_dec(arr)
+  szx = val & 0x7
+  val >>= 3
+  m = val & 1
+  val >>= 1
+  return val, m, 2**(szx + 4)
+end
+
+class CoAPOPTHDR < BitStruct
+  unsigned    :coap_opt_delta,   4,     "Option Delta Value"
+  unsigned    :coap_opt_length,  4,     "Option Length"
+  rest        :body,                    "Body of message"
+end
+
+def coap_opt_enc delta, payload
+
+  h = CoAPOPTHDR.new
+  d, d_ext = cpap_opt_val_enc(delta)
+  pl, pl_ext = cpap_opt_val_enc(payload.size)
+
+  h.coap_opt_delta = d
+  h.coap_opt_length = pl
+  h << d_ext
+  h << pl_ext
+  h << payload
+  h
+end
+
+def coap_default_accept method
+  case method
+  when COAP_CODE_GET
+      COAP_FORMAT_APPL_YANG_DATA_CBOR
+  when COAP_CODE_FETCH
+      COAP_FORMAT_APPL_YANG_INSTANCES_CBOR
+  when COAP_CODE_POST
+      # TODO: Change to COAP_FORMAT_APPL_YANG_INSTANCES_CBOR when POST has been updated to core-comi-17
+      COAP_FORMAT_UNSPECIFIED
+  else
+      COAP_FORMAT_UNSPECIFIED
+  end
+end
+
+def coap_default_content_format method
+  case method
+  when COAP_CODE_POST
+      # TODO: Change to COAP_FORMAT_APPL_YANG_INSTANCES_CBOR when POST has been updated to core-comi-17
+      COAP_FORMAT_APPL_YANG_DATA_CBOR
+  when COAP_CODE_PUT
+      COAP_FORMAT_APPL_YANG_DATA_CBOR
+  when COAP_CODE_FETCH
+      COAP_FORMAT_APPL_YANG_IDENTIFIERS_CBOR
+  when COAP_CODE_IPATCH
+      COAP_FORMAT_APPL_YANG_INSTANCES_CBOR
+  else
+      COAP_FORMAT_UNSPECIFIED
+  end
+end
+
+class CoAPHDR < BitStruct
+  unsigned    :coap_ver,   2,     "Version"
+  unsigned    :coap_t,     2,     "Type"
+  unsigned    :coap_tkl,   4,     "Token Length"
+  unsigned    :coap_code,  8,     "Code"
+  unsigned    :coap_msgid, 16,    "Message ID"
+  rest        :body,              "Body of message"
+
+  note "Body contains optional token, options, 0xF delimitor and payload"
+
+  initial_value.coap_ver = 1
+  initial_value.coap_tkl = 0
+end
+
+class CoapFrame
+  attr_accessor :type, :code_class, :code_detail, :payload, :msgid, :token
+  attr_accessor :uri_paths
+  attr_accessor :uri_keys
+  attr_accessor :content_type
+  attr_accessor :accept
+
+  attr_accessor :block1_block_size
+  attr_accessor :block1_more
+  attr_accessor :block1_num
+
+  attr_accessor :block2_block_size
+  attr_accessor :block2_more
+  attr_accessor :block2_num
+
+
+  def initialize data = nil
+    if data
+      h = CoAPHDR.new data
+      raise "Unexpected version: #{h.coap_ver}" if h.coap_ver != 1
+
+      @type = h.coap_t
+      @code_class = h.coap_code >> 5
+      @code_detail = h.coap_code & 0x1F
+      @msgid = h.coap_msgid
+      data = h.body.unpack("C*")
+
+      if h.coap_tkl > 0
+        if data.size < h.coap_tkl
+          raise "Token not present in data"
+        end
+        @token = data.shift(h.coap_tkl).pack("C*")
+      end
+
+      return if data.size == 0
+
+      # pop options while present
+      opt_number = 0
+      while data.size > 0 && data[0] != 255
+        opthdr = CoAPOPTHDR.new(data.shift(1).pack("C"))
+        option_size = 0
+        opt_delta = 0
+        if opthdr.coap_opt_delta == 13
+          raise "underflow in option" if data.size < 1
+          opt_delta = data.shift(1)[0] + 13
+
+        elsif opthdr.coap_opt_delta == 14
+          raise "underflow in option" if data.size < 2
+          opt_delta = data.shift(2).pack("C*").unpack("n") + 269
+
+        elsif opthdr.coap_opt_delta == 15
+          raise "Reserved option delta!"
+        else
+          opt_delta = opthdr.coap_opt_delta
+        end
+
+        val_size = 0
+        if opthdr.coap_opt_length == 13
+          raise "underflow in option" if data.size < 1
+          val_size = data.shift(1)[0] + 13
+
+        elsif opthdr.coap_opt_length == 14
+          raise "underflow in option" if data.size < 2
+          val_size = data.shift(2).pack("C*").unpack("n") + 269
+
+        elsif opthdr.coap_opt_length == 15
+          raise "Reserved option delta!"
+        else
+          val_size = opthdr.coap_opt_length
+        end
+
+        raise "underflow option value" if data.size < val_size
+
+        opt_number += opt_delta
+
+        case opt_number
+        when COAP_OPT_URI_PATH
+          @uri_paths = data.shift(val_size).pack("c*")
+        when COAP_OPT_CONTENT_FORMAT
+          @content_type = coap_opt_uint_dec(data.shift(val_size))
+        when COAP_OPT_URI_QUERY
+          @uri_keys = data.shift(val_size).pack("c*")
+        when COAP_OPT_ACCEPT
+          @accept = coap_opt_uint_dec(data.shift(val_size))
+        when COAP_OPT_BLOCK1
+          @block1_num, @block1_more, @block1_block_size = coap_opt_block_dec(data.shift(val_size))
+        when COAP_OPT_BLOCK2
+          @block2_num, @block2_more, @block2_block_size = coap_opt_block_dec(data.shift(val_size))
+        else
+          #STDERR.puts "Skipping option #{opt_number}"
+          data.shift(val_size)
+        end
+      end
+
+      return if data.size == 0
+
+      delim = data.shift(1).first
+      raise "Unexpected delimitor #{delim}" if delim != 255
+      @payload = data.pack("c*")
+    end
+  end
+
+  def to_s
+    s = []
+    s << "type: #{@type}" if @type
+    s << "code_class: #{@code_class}" if @code_class
+    s << "code_detail: #{@code_detail}" if @code_detail
+    s << "payload-length: #{@payload.size}" if @payload
+    s << "msgid: #{@msgid}" if @msgid
+    if @uri_paths
+        s << "uri_path: "
+        @uri_paths.each { |path|
+            s << " #{path}"
+        }
+    end
+    if @uri_keys
+        s << "uri_key: "
+        @uri_keys.each { |key|
+            s << " #{key}"
+        }
+    end
+    s << "content_type: #{@content_type}" if @content_type
+    s << "accept: #{@accept}" if @accept
+    s << "block1_block_size: #{@block1_block_size}" if @block1_block_size
+    s << "block1_more: #{@block1_more}" if @block1_more
+    s << "block1_num: #{@block1_num}" if @block1_num
+    s << "block2_block_size: #{@block2_block_size}" if @block2_block_size
+    s << "block2_more: #{@block2_more}" if @block2_more
+    s << "block2_num: #{@block2_num}" if @block2_num
+    return s.join(" ")
+  end
+
+  def opt_delta val_last, val_cur
+    raise "Wrong option order" if val_cur < val_last
+    v = val_cur - val_last
+    return val_cur, v
+  end
+
+  def enc
+    h = CoAPHDR.new
+    h.coap_t = @type
+    h.coap_code = (@code_class << 5) | (@code_detail)
+    h.coap_msgid = @msgid
+    h.coap_tkl = @token.size if @token
+
+    opt_last = 0
+    if @uri_paths
+      @uri_paths.each { |opt|
+        if opt.length > 0
+          opt_last, opt_delta = opt_delta(opt_last, COAP_OPT_URI_PATH)
+          h << coap_opt_enc(opt_delta, opt)
+        end
+      }
+    end
+
+    if @content_type
+      opt_last, opt_delta = opt_delta(opt_last, COAP_OPT_CONTENT_FORMAT)
+      h << coap_opt_enc(opt_delta, coap_opt_uint_enc(@content_type))
+    end
+
+    if @uri_keys
+      @uri_keys.each { |opt|
+        if opt.length > 0
+          opt_last, opt_delta = opt_delta(opt_last, COAP_OPT_URI_QUERY)
+          h << coap_opt_enc(opt_delta, opt)
+        end
+      }
+    end
+
+    if @accept
+      opt_last, opt_delta = opt_delta(opt_last, COAP_OPT_ACCEPT)
+      h << coap_opt_enc(opt_delta, coap_opt_uint_enc(@accept))
+    end
+
+    if @block2_block_size and @block2_more and @block2_num
+      opt_last, opt_delta = opt_delta(opt_last, COAP_OPT_BLOCK2)
+      h << coap_opt_enc(opt_delta, coap_opt_block_enc(@block2_num, @block2_more, @block2_block_size))
+    end
+
+    if @block1_block_size and @block1_more and @block1_num
+      opt_last, opt_delta = opt_delta(opt_last, COAP_OPT_BLOCK1)
+      h << coap_opt_enc(opt_delta, coap_opt_block_enc(@block1_num, @block1_more, @block1_block_size))
+    end
+
+    if @payload && (@payload !="")
+      h << [255].pack("C")
+      h << @payload
+    end
+
+    return h
+  end
+
+end
+
+def coap_frame_build type, code, msgid, paths = nil, keys = nil, payload = nil
+  f = CoapFrame.new
+  if payload
+      content_type = $cc_opt.fetch(:content_type, coap_default_content_format(code))
+      f.content_type = content_type if content_type > COAP_FORMAT_UNSPECIFIED
+    f.payload = payload
+  end
+  accept = $cc_opt.fetch(:accept, coap_default_accept(code))
+  f.accept = accept if accept > COAP_FORMAT_UNSPECIFIED
+  f.type = type
+  f.code_class = 0
+  f.code_detail = code
+  f.msgid = msgid
+  f.uri_paths = paths
+  f.uri_keys = keys
+  f.block2_block_size = $blok2_size
+  f.block2_more = 0
+  f.block2_num = 0
+  return f
+end
+
+class SYSREQ < BitStruct
+  unsigned    :cmd,   8,     "Sys request command"
+  rest        :body,         "Body of sys request"
+end
+
+class MUP1
+  attr_accessor :timeout
+
+  def initialize scheme, stream
+        @dbg = []
+    @state = :init
+    @mup1_rx_queue = []
+    @scheme = scheme
+    @timeout = 5
+    @stream = stream
+  end
+
+  def poll_input timeout = nil
+    timeout = @timeout if not timeout
+    rs, ws = IO.select([@stream], [], [], timeout)
+    if rs != nil and r = rs[0]
+      r.read_nonblock(512).unpack("C*").each do |c|
+        mup1_rx_sm c
+      end
+    end
+  end
+
+  def mup1_rx_sm c
+    case @state
+    when :init
+      if c == SYM_SOF
+        @state = :sof
+        @mup1_data = []
+        @mup1_data_chk = [SYM_SOF]
+        @mup1_chk = []
+        @mup1_type = 0
+      end
+
+    when :sof
+      @mup1_type = c
+      @state = :data
+      @mup1_data_chk << c
+
+    when :data
+      if @mup1_data.size > 1024
+        $stderr.puts "Frame too big!"
+        @state = :init
+      else
+        case c
+        when SYM_ESC
+          @state = :esc
+
+        when SYM_EOF
+          @mup1_data_chk += @mup1_data
+          @mup1_data_chk << SYM_EOF
+
+          if @mup1_data.size % 2 != 0
+            # We have an odd sized header, meaning that even sized message shall
+            # lead to single EOF
+            @state = :chk0
+          else
+            # We have an odd sized header, meaning that odd sized message shall
+            # lead to two EOF
+            @state = :eof2
+            @mup1_data_chk << SYM_EOF
+          end
+
+        when SYM_SOF, 0, 0xff
+          $stderr.puts "invalid data element: '#{c}'"
+          @state = :init
+
+        else
+          @mup1_data << c
+        end
+      end
+
+    when :esc
+      @state = :data
+      case c
+      when SYM_SOF, SYM_ESC, SYM_EOF
+        @mup1_data << c
+      when SYM_00
+        @mup1_data << 0x00
+      when SYM_FF
+        @mup1_data << 0xFF
+      else
+        $stderr.puts "invalid escape sequence: '#{c}'"
+        @state = :init
+      end
+
+    when :eof2
+      if c == SYM_EOF
+        @state = :chk0
+      else
+        $stderr.puts "Expected repeated esc, got #{c} / #{"%c"%c}"
+        @state = :init
+      end
+
+    when :chk0
+      @mup1_chk << c
+      @state = :chk1
+
+    when :chk1
+      @mup1_chk << c
+      @state = :chk2
+
+    when :chk2
+      @mup1_chk << c
+      @state = :chk3
+
+    when :chk3
+      @mup1_chk << c
+      @state = :init
+
+      chk = checksum_calc(@mup1_data_chk).unpack("C*")
+      if chk != @mup1_chk
+        STDERR.puts "MUP1 Checksum error!"
+      else
+        @mup1_rx_queue << {:type => @mup1_type, :data => @mup1_data}
+      end
+    end
+  end
+
+  def mup1_frame_get timeout_ = nil
+    if @mup1_rx_queue.size == 0
+      poll_input timeout_
+    end
+
+    frame = @mup1_rx_queue.shift
+    return nil if not frame
+
+    return [frame[:type]].pack("C"), frame[:data].pack("C*")
+  end
+
+  def mup1_frame_inj type, data = ""
+    # Build the frame un-escaped to calculate checksum
+    frame_a = [SYM_SOF, type.ord] + data.unpack("C*") + [SYM_EOF]
+    frame_a << SYM_EOF if data.size % 2 == 0
+    cs = checksum_calc frame_a
+
+    # Build the frame escaped to be injected
+    frame = ">"
+    frame << type
+    if !data.nil?
+      data_array = data.unpack("C*")
+      escaped_data_array = Array.new
+      data_array.each { |byte|
+        if ((byte == SYM_SOF) || (byte == SYM_EOF) || (byte == SYM_ESC) ||
+            (byte == 0x00) || (byte == 0xFF))
+          escaped_data_array << SYM_ESC #Insert escape character '\'
+        end
+        if (byte == 0x00)
+            byte = SYM_00
+        end
+        if (byte == 0xFF)
+            byte = SYM_FF
+        end
+        escaped_data_array << byte
+      }
+      frame << escaped_data_array.pack("c*")
+    end
+    frame << "<"
+    if (data.nil? || ((data.size % 2) == 0))
+      frame << "<"
+    end
+    frame << cs
+
+    write frame
+  end
+
+  def write s
+    @stream.write s
+    @stream.flush
+  end
+
+  def checksum_calc data
+    sum = data.pack("C*").unpack("n*").sum
+
+    # Add carry twice (the first addition may cause another, e.g. 0x1ffff)
+    sum = ((sum >> 16) + (sum & 0xffff))
+    sum = ((sum >> 16) + (sum & 0xffff))
+
+    sum = ~sum
+    sum = sum & 0xFFFF
+
+    #Convert checksum to ascii string
+    ascii = "%.4x" %sum
+
+    return ascii
+  end
+end
+
+def success_detail (detail)
+  case detail.to_i
+  when 1
+    return "Created"
+  when 2
+    return "Deleted"
+  when 3
+    return "Valid"
+  when 4
+    return "Changed"
+  when 5
+    return "Content"
+  else
+    return "Unknown"
+  end
+end
+
+def c_error_detail (detail)
+  case detail.to_i
+  when 0
+    return "Bad Request"
+  when 1
+    return "Unauthorized"
+  when 2
+    return "Bad Option"
+  when 3
+    return "Forbidden"
+  when 4
+    return "Not Found"
+  when 5
+    return "Method Not Allowed"
+  when 6
+    return "Not Acceptable"
+  when 8
+    return "Request Entity Incomplete"
+  when 9
+    return "Conflict"
+  when 12
+    return "Precondition Failed"
+  when 13
+    return "Request Entity Too Large"
+  when 15
+    return "Unsupported Content-Format"
+  else
+    return "Unknown"
+  end
+end
+
+def s_error_detail (detail)
+  case detail.to_i
+  when 0
+    return "Internal Server Error"
+  when 1
+    return "Not Implemented"
+  when 2
+    return "Bad Gateway"
+  when 3
+    return "Service Unavailable"
+  when 4
+    return "Gateway Timeout"
+  when 5
+    return "Proxying Not Supported"
+  else
+    return "Unknown"
+  end
+end
+
+def end_session
+  #Send COAP ping to terminate session
+  ping_frame = coap_frame_build COAP_TYPE_CONFIRMABLE, 0, 0
+  $mup1.mup1_frame_inj "c", ping_frame.enc
+end
+
+
+# Open socket to serial line
+term = URI($device)
+sock = TCPSocket.open(term.host, term.port)
+sport = sock.addr[1]
+$mup1 = MUP1.new("easytest", sock)
+
+if ($cmd == "coap")
+  payload_expected = false
+  case $coap_method
+  when "get"
+    payload_expected = true
+    method = COAP_CODE_GET
+  when "put"
+    method = COAP_CODE_PUT
+  when "del"
+    method = COAP_CODE_DEL
+  when "post"
+    method = COAP_CODE_POST
+  end
+
+  if !$coap_payload.nil?
+    # Payload must be added to COAP frame. Payload is split into chonk's of Block 1 size
+    $pl_split = $coap_payload.scan(/.{1,#{$blok1_size}}/m)
+  else
+    # No Payload to add. The split array contains just nil
+    $pl_split = Array.new(1, $coap_payload)
+  end
+
+  # Build the MUP1 COAP frame to inject the first element in the Payload split
+  $inj_coap_frame = coap_frame_build COAP_TYPE_CONFIRMABLE, method, sport, $coap_url_paths, $coap_url_keys, $pl_split[0]
+  if ($pl_split.size > 1)
+    # More blocks to transmit - create the block1 option parameters
+    $inj_coap_frame.block1_block_size = $blok1_size
+    $inj_coap_frame.block1_more = 1
+    $inj_coap_frame.block1_num = 0
+  end
+
+  #Inject the MUP1 COAP frame
+  $mup1.mup1_frame_inj "c", $inj_coap_frame.enc
+
+  #First element has been transmitted
+  $pl_split.shift
+end
+
+if ($cmd == "cc")
+  payload_expected = false
+  case $cc_method
+  when "get"
+    payload_expected = true
+    method = COAP_CODE_GET
+  when "put"
+    method = COAP_CODE_PUT
+  when "del"
+    method = COAP_CODE_DEL
+  when "post"
+    method = COAP_CODE_POST
+  when "fetch"
+    payload_expected = true
+    method = COAP_CODE_FETCH
+  when "ipatch"
+    method = COAP_CODE_IPATCH
+  end
+
+  $stderr.puts "MUP1CT method #{$cc_method}"
+  if !$coap_payload.nil?
+    # Payload must be added to COAP frame. Payload is split into chonk's of Block 1 size
+    $pl_split = $coap_payload.scan(/.{1,#{$blok1_size}}/m)
+  else
+    # No Payload to add. The split array contains just nil
+    $pl_split = Array.new(1, $coap_payload)
+  end
+
+  $coap_url_paths = [$cc_opt[:datastore]]
+  $coap_url_paths << sid_encode($cc_opt[:sid]) if !$cc_opt[:sid].nil?
+
+  cbor_seq = ""
+  $keys_diag.each do |k| 
+    stdout_str, stderr_str, status = Open3.capture3("cbor-diag --from diag --to bytes", :stdin_data=>k)
+    if (status.to_i == 0)
+      cbor_seq += stdout_str
+    else
+      puts "cbor-diag error: cannot process #{k}"
+      puts " error msg: #{stderr_str}"
+      exit -1
+    end
+  end
+
+  $coap_url_keys = [Base64.urlsafe_encode64(cbor_seq, padding: false)]
+
+  $flags_diag.each do |f|
+    $coap_url_keys << f
+  end
+
+  $stderr.puts "MUP1CT paths  #{$coap_url_paths}"
+  $stderr.puts "MUP1CT coap_url_keys: #{$keys_diag} -> #{$coap_url_keys}"
+    
+
+  # Build the MUP1 COAP frame to inject the first element in the Payload split
+  $inj_coap_frame = coap_frame_build COAP_TYPE_CONFIRMABLE, method, sport, $coap_url_paths, $coap_url_keys, $pl_split[0]
+
+
+  if ($pl_split.size > 1)
+    # More blocks to transmit - create the block1 option parameters
+    $inj_coap_frame.block1_block_size = $blok1_size
+    $inj_coap_frame.block1_more = 1
+    $inj_coap_frame.block1_num = 0
+  end
+
+  #Inject the MUP1 COAP frame
+  $mup1.mup1_frame_inj "c", $inj_coap_frame.enc
+
+  #First element has been transmitted
+  $pl_split.shift
+end
+
+if ($cmd == "ping")
+  #Inject the MUP1 COAP frame
+  $mup1.mup1_frame_inj "p"
+end
+
+if ($cmd == "sysrq")
+  #SYS request command
+  if ($sys_trace)
+    data = SYSREQ.new
+    data.cmd = "t".ord
+    data << $sys_trace_args
+    $mup1.mup1_frame_inj "s", data
+  end
+  if ($sys_dump)
+    data = SYSREQ.new
+    data.cmd = "d".ord
+    data << $sys_dump_args
+    $mup1.mup1_frame_inj "s", data
+  end
+end
+
+cbor = String.new
+
+trace_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+pong_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+responce_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+ack_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+responce_received = false
+ack_received = false
+
+# Get the response
+while true do
+  if (coap_op && !ack_received)
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - ack_start
+    if (elapsed > (($pl_split.size != 0) ? COAP_ACK_WAIT_TIME : COAP_LAST_ACK_WAIT_TIME))
+      STDERR.print "R"
+      #Ack time expired - retransmit
+      #Inject the MUP1 COAP frame
+      $mup1.mup1_frame_inj "c", $inj_coap_frame.enc
+      ack_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+  end
+  if (!responce_received)
+    #So far no respond received - check for response time out
+    elapsed = $responce_wait_forever ? 0 :
+              Process.clock_gettime(Process::CLOCK_MONOTONIC) - responce_start
+
+    if (elapsed > $response_wait)
+      if ($cmd == "ping")
+        STDERR.puts "No PONG frame received"
+      end
+      if (coap_op)
+        end_session
+        STDERR.puts "No COAP response frame received"
+      end
+      if ($cmd == "listen")
+        STDERR.puts "End of listen"
+      end
+      return
+    end
+
+    if (coap_op && !ack_received)
+      mup1_wait = COAP_ACK_WAIT_TIME
+    else
+      mup1_wait = $response_wait - elapsed
+    end
+  else
+    #Response is received - check for trace time out
+    if ($trace)
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - trace_start
+      if (elapsed > $trace_wait)
+        if (coap_op)
+          end_session
+        end
+        return
+      end
+    else
+      if (coap_op)
+        end_session
+      end
+      return
+    end
+
+    mup1_wait = $trace_wait - elapsed
+  end
+
+  # Get the MUP1 frame
+  type, mup1_data = $mup1.mup1_frame_get mup1_wait
+
+  if (!type)
+    #No frame is received - mup1_wait timeout
+    next
+  end
+
+  if $trace && (type == 'T')    #Trace frame
+    STDERR.print "#{mup1_data}"
+    if $trace_restart
+      trace_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+    if ($sys_dump)
+        responce_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+    next
+  end
+
+  if responce_received
+    next
+  end
+
+  if (type == 'P')    #Ping response frame
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - pong_start
+    mup1_data_elements = mup1_data.split(' ')
+    STDERR.puts "Pong received in #{(elapsed*1000).truncate(2)} ms"
+    STDERR.puts "Build #{mup1_data_elements[0]}"
+    STDERR.puts "Up Time #{mup1_data_elements[1]}"
+    if (!mup1_data_elements[2].nil?)
+        STDERR.puts "Data size #{mup1_data_elements[2]}"
+    end
+    if (!mup1_data_elements[3].nil?)
+        STDERR.puts "Version #{mup1_data_elements[3]}"
+    end
+    responce_received = true
+    trace_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    next
+  end
+
+  if (type == 'C')    #COAP response frame
+    #Extract and decode the COAP frame
+    rx_coap_frame = CoapFrame.new mup1_data
+    rx_id = rx_coap_frame.msgid
+    tx_id = $inj_coap_frame.msgid
+    if (rx_id != tx_id)
+        STDERR.puts "Received msgid #{rx_id}, expected #{tx_id}"
+        next
+    end
+
+    block2_more = (!rx_coap_frame.block2_more.nil? && (rx_coap_frame.block2_more == 1)) ? true : false
+    ack_received = (rx_coap_frame.type == COAP_TYPE_ACK) ? true : false
+
+    #Decode the return code
+    cdetail = rx_coap_frame.code_detail
+    cclass = rx_coap_frame.code_class
+    if (cclass == 2)
+      if (($pl_split.size == 0) && !block2_more)
+        STDERR.puts "RESPONSE-CODE: class 2 detail #{cdetail} Success #{success_detail(cdetail)}"
+      end
+    end
+    if (cclass == 4)
+      STDERR.puts "RESPONSE-CODE: class 4 detail #{cdetail} Client Error #{c_error_detail(cdetail)}"
+      end_session
+      return
+    end
+    if (cclass == 5)
+      STDERR.puts "RESPONSE-CODE: class 5 detail #{cdetail} Server Error #{s_error_detail(cdetail)}"
+      end_session
+      return
+    end
+    if !rx_coap_frame.payload.nil?
+        #Payload is received - Build the CBOR buffer
+        cbor = cbor + rx_coap_frame.payload
+
+        if ($cmd == "listen")
+          #Listen mode
+          if (!block2_more)
+            Open3::popen3("cbor-diag --from bytes --to compact") do |_i, _o, _e, _t|
+              _i.write cbor
+              _i.flush
+              _i.close
+              puts _o.gets
+              puts _e.gets
+              _o.close
+              _e.close
+            end
+            cbor.clear()
+          end
+          #Get next block
+          next
+        end
+
+        if (block2_more)
+            STDERR.print "."
+            #This is get block-wise transfer
+            #Inject MUP1 COAP frame to get next block
+            $inj_coap_frame.msgid += 1  # Increment the message ID
+            $inj_coap_frame.block2_num += 1
+            $mup1.mup1_frame_inj "c", $inj_coap_frame.enc
+            # Restart responce timer
+            ack_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            responce_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            ack_received = false
+
+            #Get next block
+            next
+        end
+
+        if !$output_file.nil?
+            #Print to output file
+            $output_file.write(cbor)
+            $output_file.close
+        else
+            #Print to STDOUT with no new line
+            print "#{cbor}"
+        end
+    else
+        # No payload received
+        if ($cmd == "listen")
+          next
+        end
+
+        if payload_expected
+            STDERR.puts "No payload in received COAP frame"
+            next
+        end
+
+        if ($pl_split.size > 0)
+          STDERR.print "."
+          # Not all payload is block-wise transmitted - Inject the MUP1 COAP frame with next block
+          $inj_coap_frame.msgid += 1  # Increment the message ID
+          $inj_coap_frame.block1_num += 1
+          $inj_coap_frame.payload = $pl_split.shift
+          $inj_coap_frame.block1_more = ($pl_split.size == 0) ? 0 : 1
+
+          $mup1.mup1_frame_inj "c", $inj_coap_frame.enc
+          # Restart response timer
+          ack_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          responce_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          ack_received = false
+          next
+        else
+          STDERR.puts "All blocks transmitted"
+        end
+    end
+
+    responce_received = true
+    trace_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+#Decode the CBOR payload
+#cbor_decoded = CBOR.decode(cbor)
+#puts "*****cbor_decoded #{cbor_decoded}"
+#puts "****cbor_decoded[7026][0][134] #{cbor_decoded[7026][0][134]}"
+#puts "****cbor_decoded[7026][0][3] #{cbor_decoded[7026][0][3]}"
+  end
+end

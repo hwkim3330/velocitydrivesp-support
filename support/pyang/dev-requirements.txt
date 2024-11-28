@@ -1,0 +1,6 @@
+coveralls
+pycodestyle
+pyflakes
+flake8
+pylint
+virtualenv

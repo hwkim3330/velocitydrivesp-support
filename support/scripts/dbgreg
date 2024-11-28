@@ -1,0 +1,212 @@
+#!/usr/bin/env ruby
+
+# Copyright (c) 2021-2022 Microchip Technology Inc. and its subsidiaries.
+# SPDX-License-Identifier: MIT
+
+require 'optparse'
+require 'open3'
+require 'cbor-pure'
+require 'treetop'
+require 'cbor-diag-parser'
+
+LM_DBG_REG_TYPE_MIIM_C22_RD = 0
+LM_DBG_REG_TYPE_MIIM_C22_WR = 1
+LM_DBG_REG_TYPE_MIIM_C45_RD = 2
+LM_DBG_REG_TYPE_MIIM_C45_WR = 3
+LM_DBG_REG_TYPE_SWITCH_RD = 4
+LM_DBG_REG_TYPE_SWITCH_WR = 5
+
+LM_DBG_REG_FIELDS_TYPE = 0
+LM_DBG_REG_FIELDS_RES_STATUS = 1
+LM_DBG_REG_FIELDS_REG_ADDR = 2
+LM_DBG_REG_FIELDS_REG_VALUE = 3
+LM_DBG_REG_FIELDS_PORT = 4
+
+USAGE = <<-USAGE
+dbgreg - Register access debug tool
+
+
+Usage:
+  dbgreg [options] miim [c22|c45]  (<PORT>[:<MMD>]:<REG_ADDR>[=VAL])...
+
+Options:
+  -h --help                  Show this screen.
+  -d --device <URL>          IP based terminal device to connect to.
+                             Ex: termhub://10.0.0.2:4000
+
+Command details:
+  dbgreg [options] miim|sw [(c22|c45)] (rd|wr)  (<PORT>[:<MMD>]:<REG_ADDR>[=VAL])...
+  Do a MIIM or Switch read or write request
+USAGE
+
+OptionParser.new do |opts|
+    opts.banner = "Usage: #{$0}"
+
+    opts.on("-h", "--help", "") do |h|
+      puts USAGE
+      exit
+    end
+
+    opts.on("-d", "--device <URL>", "The device terminal URL") do |d|
+      $dev = d
+    end
+end.parse!
+
+$cmd = ARGV.shift
+
+if $cmd.nil? or (not ["miim"].include?($cmd) and not ["sw"].include?($cmd))
+    puts "No command specified or not supported!"
+    exit -1
+end
+
+
+if $cmd == "miim"
+  req = []
+  bus = 0
+  clause = :c22
+
+  while a = ARGV.shift
+    case a
+    when "c22"
+    when "c45"
+
+    when /^(\w+):(\w+):(\w+)=(\w+)$/
+      res = [Integer($1, exception: false),
+             Integer($2, exception: false),
+             Integer($3, exception: false),
+             Integer($4, exception: false)]
+      raise "Did not understand: #{a}" if res.include? nil
+      req << { :port => res[0], :mmd => res[1], :reg => res[2],
+               :val => res[3], :clause => clause }
+
+    when /^(\w+):(\w+)=(\w+)$/
+      res = [Integer($1, exception: false),
+             Integer($2, exception: false),
+             Integer($3, exception: false)]
+      raise "Did not understand: #{a}" if res.include? nil
+      req << { :port => res[0], :mmd => 0, :reg => res[2],
+               :val => res[2], :clause => clause }
+
+    when /^(\w+):(\w+):(\w+)$/
+      res = [Integer($1, exception: false),
+             Integer($2, exception: false),
+             Integer($3, exception: false)]
+      raise "Did not understand: #{a}" if res.include? nil
+      req << { :port => res[0], :mmd => res[1], :reg => res[2],
+               :clause => clause }
+
+    when /^(\w+):(\w+)$/
+      res = [Integer($1, exception: false),
+             Integer($2, exception: false)]
+      raise "Did not understand: #{a}" if res.include? nil
+      req << { :port => res[0], :reg => res[1], :clause => clause }
+
+    else
+      puts "Did not understand: #{a}"
+      exit -1
+    end
+  end
+
+  req.collect! do |r|
+    fields = []
+    f = "#{LM_DBG_REG_FIELDS_TYPE}:"
+    if r[:clause] == :c22 and r[:val].nil?
+      f += LM_DBG_REG_TYPE_MIIM_C22_RD.to_s
+    elsif r[:clause] == :c22 and r[:val]
+      f += LM_DBG_REG_TYPE_MIIM_C22_WR.to_s
+    elsif r[:clause] == :c45 and r[:val]
+      f += LM_DBG_REG_TYPE_MIIM_C45_RD.to_s
+    elsif r[:clause] == :c45 and r[:val]
+      f += LM_DBG_REG_TYPE_MIIM_C45_WR.to_s
+    else
+      raise "Ehhh...."
+    end
+    fields << f
+    fields << "#{LM_DBG_REG_FIELDS_PORT}:#{r[:port]}"
+    fields << "#{LM_DBG_REG_FIELDS_REG_ADDR}:#{r[:reg]}"
+    fields << "#{LM_DBG_REG_FIELDS_REG_VALUE}:#{r[:val]}" if r[:val]
+    "{#{fields.join(",")}}"
+  end
+  diag = "[#{req.join(",")}]"
+
+  parser = CBOR_DIAGParser.new
+  diag_ = parser.parse diag
+  cbor = CBOR::encode(diag_.to_rb)
+
+  dev_opts = ""
+  dev_opts = "-d #{$dev}" if $dev
+
+  cmd = "mup1ct #{dev_opts} coap post /dbg/reg --content-type 60 --accept 60"
+  puts cmd
+  cbor_out, err, status = Open3.capture3(cmd, stdin_data: cbor, binmode: true)
+  puts "Status: #{status.to_i}, stderr: #{err}, got #{cbor_out.size} bytes"
+
+  begin
+    back = CBOR::decode(cbor_out)
+    pp back
+  rescue
+    puts "Failed to decode output as cbor"
+    o, e, s = Open3.capture3("hexdump -C", stdin_data: cbor_out, binmode: true)
+    puts o
+  end
+else
+  req = []
+  while a = ARGV.shift
+    case a
+    when /^(\w+)=(\w+)$/
+      res = [Integer($1, exception: false),
+             Integer($2, exception: false)]
+      raise "Did not understand: #{a}" if res.include? nil
+      req << { :reg => res[0], :val => res[1]}
+    when /^(\w+)$/
+      res = [Integer($1, exception: false)]
+      raise "Did not understand: #{a}" if res.include? nil
+      req << { :reg => res[0]}
+    else
+      puts "Did not understand: #{a}"
+      exit -1
+    end
+  end
+
+  req.collect! do |r|
+    fields = []
+    f = "#{LM_DBG_REG_FIELDS_TYPE}:"
+    if r[:reg] && r[:val]
+        puts "1"
+      f += LM_DBG_REG_TYPE_SWITCH_WR.to_s
+    elsif r[:reg]
+        puts "2"
+      f += LM_DBG_REG_TYPE_SWITCH_RD.to_s
+    else
+      raise "Ehhh...."
+    end
+    fields << f
+    fields << "#{LM_DBG_REG_FIELDS_REG_ADDR}:#{r[:reg]}"
+    fields << "#{LM_DBG_REG_FIELDS_REG_VALUE}:#{r[:val]}" if r[:val]
+    "{#{fields.join(",")}}"
+  end
+  diag = "[#{req.join(",")}]"
+  pp diag
+  parser = CBOR_DIAGParser.new
+  diag_ = parser.parse diag
+  cbor = CBOR::encode(diag_.to_rb)
+
+  dev_opts = ""
+  dev_opts = "-d #{$dev}" if $dev
+
+  cmd = "mup1ct #{dev_opts} coap post /dbg/reg --content-type 60 --accept 60"
+  puts cmd
+  cbor_out, err, status = Open3.capture3(cmd, stdin_data: cbor, binmode: true)
+  puts "Status: #{status.to_i}, stderr: #{err}, got #{cbor_out.size} bytes"
+
+  begin
+    back = CBOR::decode(cbor_out)
+    pp back
+  rescue
+    puts "Failed to decode output as cbor"
+    o, e, s = Open3.capture3("hexdump -C", stdin_data: cbor_out, binmode: true)
+    puts o
+  end
+end
+
+

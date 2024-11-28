@@ -1,0 +1,9 @@
+# Copyright (c) 2021-2022 Microchip Technology Inc. and its subsidiaries.
+# SPDX-License-Identifier: MIT
+
+---
+- "/mchp-velocitysp-system:save-config":
+- "/ieee802-dot1q-bridge:bridges/bridge[name='b0']/component[name='c0']/mchp-velocitysp-bridge:fdb-flush":
+    input:
+      vid: 10
+      port: 1

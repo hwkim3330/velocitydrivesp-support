@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module name="groupings"
+        xmlns="urn:ietf:params:xml:ns:yang:yin:1"
+        xmlns:p="urn:test">
+  <namespace uri="urn:test"/>
+  <prefix value="p"/>
+  <container name="bar">
+    <uses name="p:foo"/>
+    <uses name="outer"/>
+  </container>
+  <grouping name="foo">
+    <leaf name="baz">
+      <type name="int8"/>
+    </leaf>
+  </grouping>
+  <grouping name="outer">
+    <grouping name="inner">
+      <leaf name="kage">
+        <type name="string"/>
+      </leaf>
+    </grouping>
+    <uses name="inner"/>
+  </grouping>
+</module>

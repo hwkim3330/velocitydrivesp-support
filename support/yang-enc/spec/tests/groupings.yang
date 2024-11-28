@@ -1,0 +1,25 @@
+module groupings {
+    namespace "urn:test";
+    prefix p;
+
+    container bar {
+        uses p:foo;
+        uses outer;
+    }
+
+    grouping foo {
+        leaf baz {
+            type int8;
+        }
+    }
+
+    grouping outer {
+        grouping inner {
+            leaf kage {
+                type string;
+            }
+        }
+
+        uses inner;
+    }
+}

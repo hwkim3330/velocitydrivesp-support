@@ -1,0 +1,39 @@
+module b {
+  yang-version 1.1;
+  namespace urn:b;
+  prefix b;
+
+  import a {
+    prefix a;
+  }
+
+  feature foo;
+  feature bar;
+
+  container a {
+    if-feature "foo and not bar or a:foo";
+  }
+
+  container b {
+    if-feature "foo and not bar";
+  }
+
+  container c {
+    if-feature "foo and bar";
+  }
+
+  container d {
+    if-feature "not bar and a:fox";
+  }
+
+  container e {
+    if-feature "not bar and a:foz";
+  }
+
+  leaf ref-to-not-implemented {
+    type leafref {
+      path "/a:x/a:bar-gggg";
+    }
+  }
+
+}

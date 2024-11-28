@@ -1,0 +1,359 @@
+#!/usr/bin/env ruby
+
+# Copyright (c) 2021-2022 Microchip Technology Inc. and its subsidiaries.
+# SPDX-License-Identifier: MIT
+
+require 'uri'
+require 'socket'
+require 'optparse'
+require 'open3'
+require 'fileutils'
+require 'tmpdir'
+require_relative "../libeasy/handler.rb"
+require_relative "../yang-enc/yang-schema.rb"
+require_relative "../yang-enc/yang-enc.rb"
+
+class Mup1Con < Et::Handler::Base
+  def initialize lower_layer
+    super "CON"
+    lower_layer.handler_reg Et::Handler::Mup1::MUP1_CB_NON_MUP1, self
+    lower_layer.handler_reg Et::Handler::Mup1::MUP1_CB_TRACE, self
+    lower_layer.handler_reg Et::Handler::Mup1::MUP1_CB_ANNOUNCE, self
+  end
+
+  def rx type, data
+    case type
+    when Et::Handler::Mup1::MUP1_CB_NON_MUP1
+      data.strip!
+      puts "CON: #{data.inspect}" if data.size > 0
+    when Et::Handler::Mup1::MUP1_CB_TRACE
+      puts "TRACE: #{data.inspect}"
+    when Et::Handler::Mup1::MUP1_CB_ANNOUNCE
+      puts "ANNOUNCE: #{data.inspect}"
+    end
+  end
+end
+
+class Tracer
+    def initialize(level = :error)
+        @level = level
+    end
+
+    def t(mod, level, msg)
+        case level
+        when :fatal
+            puts "FATAL: #{mod}: #{msg}" if [:fatal, :error, :info, :debug].include?(@level)
+        when :err
+            puts "ERROR: #{mod}: #{msg}" if [:error, :info, :debug].include?(@level)
+        when :info
+            puts "INFO: #{mod}: #{msg}" if [:info, :debug].include?(@level)
+        when :debug
+            puts "DEBUG: #{mod}: #{msg}" if [:debug].include?(@level)
+        else
+            raise "Invalid trace level"
+        end
+    end
+end
+
+top = __dir__  # Script location
+2.times do     # Assume script is located two dirs above repository root
+    top = File.dirname(top)
+end
+# $top is now the absolute repository root
+
+# List of YAML topology files to use when searching for topology info
+TOPO = [
+    ".mscc-libeasy-topology.yaml",
+    "#{ENV["HOME"]}/.mscc-libeasy-topology.yaml"
+]
+
+# Get topology from one of the files listed in TOPO.
+$topology = nil
+TOPO.each do |f|
+    if File.exist?(f)
+        $topology = YAML.load_file(f)
+    end
+end
+
+SID_CHECKSUM = 29304 # Corresponds to ietf-constrained-yang-library:yang-library/checksum
+
+# Fetch the 16 bytes YANG Lib checksum from DUT and return it as a hex string
+def fetch_yang_lib_checksum_from_dut(coap)
+    sid = CBOR::encode(SID_CHECKSUM)
+    res = coap.fetch "/c", sid, {:content_type => 141}
+    raise "Unable to get YANG checksum" if res&.code_class != 2 or res&.code_detail != 5
+    cbor = CBOR::decode(res.payload_rx)
+    checksum = cbor.values[0].b.each_byte.map { |b| "%02x" % b }.join
+    puts "YANG Lib checksum in DUT: #{checksum}" if $opts[:verbose]
+    return checksum
+end
+
+# Remote catalog directories:
+REMOTE_CATALOGS = [
+    "http://mscc-ent-open-source.s3-website-eu-west-1.amazonaws.com/public_root/velocitydrivesp/yang-by-sha",
+    "https://artifacts.microchip.com/artifactory/UNGE-generic-local/lmstax/yang-by-sha"
+]
+
+# Find and download a remote catalog file based on the checksum and save it as 'file'
+def download_remote_catalog(checksum, file)
+    REMOTE_CATALOGS.each do |c|
+        `wget -q -O #{file} #{c}/#{checksum}.tar.gz`
+        puts "Catalog file #{File.basename(file)} found in\n  #{c}" if $?.success? and $opts[:verbose]
+        return if $?.success?
+    end
+    raise "Remote catalog based on #{checksum} not found!"
+end
+
+LOCAL_SCHEMA_BASE_DIR = "#{ENV["HOME"]}/.velocitydrive-yang-cache"
+SCHEMA_FILE = "yang_schema"
+
+# Get schema based on checksum in DUT
+def get_yang_schema(checksum)
+    schema_dir = "#{LOCAL_SCHEMA_BASE_DIR}/#{checksum}"
+    schema_file = "#{schema_dir}/#{SCHEMA_FILE}"
+
+    if File.exist?(schema_file)
+        # YANG schema for current checksum found
+        # Load and return schema
+        puts "YANG schema #{schema_file} found" if $opts[:verbose]
+        return Marshal.load(File.read(schema_file))
+    else
+        # YANG schema for current checksum NOT found
+        # Download catalog file, generate schema, save and return schema
+        puts "YANG schema #{schema_file} NOT found" if $opts[:verbose]
+        FileUtils.mkdir_p(schema_dir) unless File.directory?(schema_dir)
+        schema = nil
+        Dir.mktmpdir do |tmpdir|
+            catalog_filename = "#{tmpdir}/#{checksum}.tar.gz"
+            download_remote_catalog(checksum, catalog_filename)
+            puts "Catalog found: #{catalog_filename}" if $opts[:verbose]
+            yangs = []
+            sids = []
+            Dir.chdir(tmpdir) do
+                `tar -zxf #{checksum}.tar.gz`
+                Dir.glob('*.yang').each { |f| yangs << "#{tmpdir}/#{f}" }
+                Dir.glob('*.sid').each { |f| sids << "#{tmpdir}/#{f}" }
+            end
+            schema = generate_yang_schema(tmpdir, yangs, sids)
+            File.write(schema_file, Marshal.dump(schema))
+        end
+        return schema
+    end
+end
+
+# Get device from topology.
+def get_device
+    if $topology and $topology["dut"] and $topology["dut"]["terminal"]
+        return $topology["dut"]["terminal"]
+    end
+    return nil
+end
+
+$opts = {:device => get_device,
+         :query => [],
+        } # Add more default options here
+
+OptionParser.new do |opts|
+    opts.banner = "Usage: #{$0} [options]"
+
+    opts.on("-h", "--help", "The MUP1CC help") do |o|
+        puts opts
+        exit
+    end
+
+    opts.on("-d", "--device URL", "IP based terminal device to connect to.",
+            "Ex: termhub://10.0.0.2:4000 or /dev/ttyUSB0",
+            "If an Easytest setup is reserved then 'device' defaults to the terminal specified","in the topology file.") do |o|
+        $opts[:device] = o
+    end
+
+    opts.on("-m", "--method fetch|ipatch|get|put|post|delete", ["fetch", "ipatch", "get", "put", "post", "delete"],
+            "CoAP method to process.") do |o|
+        $opts[:method] = o
+    end
+
+    opts.on("-i", "--input FILE", "Read the request from a file. Default is read from STDIN.") do |o|
+        $opts[:input_file] = o
+        $opts[:input_file] = "#{Dir.pwd}/#{o}" if !o.start_with?('/')
+    end
+
+    opts.on("-o", "--output FILE", "Write the response to a file. Default is to write to STDOUT.") do |o|
+        $opts[:output_file] = o
+        $opts[:output_file] = "#{Dir.pwd}/#{o}" if !o.start_with?('/')
+    end
+
+    opts.on("-I", "--input-format json|yaml", ["json", "yaml"], "Force a given encoding of input.",
+            "Default is YAML, next is extension of the file in -i, final is this argument.") do |o|
+        $opts[:input_format] = o
+    end
+
+    opts.on("-O", "--output-format json|yaml", ["json", "yaml"], "Force a given encoding of output. ",
+            "Default is YAML, next is extension of the file in -o, final is this argument.") do |o|
+        $opts[:output_format] = o
+    end
+
+    opts.on("-q", "--query c=c|c=n|c=a|d=a|d=t", ["c=c", "c=n", "c=a", "d=a", "d=t"],
+            "Query parameters to get and fetch.") do |o|
+        $opts[:query].each do |q|
+            raise "Duplicate query parameter #{o}" if q.include?(o[0..1])
+        end
+        $opts[:query] << o
+    end
+
+    opts.on("-s", "--sys-trace fatal|error|info|debug", ["fatal", "error", "info", "debug"],
+            "Trace level in handler subsystem.") do |o|
+        $opts[:sys_trace] = o.to_sym
+    end
+
+    opts.on("-v", "--verbose", "Be more verbose.") do
+        $opts[:verbose] = true
+    end
+
+    opts.on("-w", "--[no-]workspace", "Use the YANG catalog from the current workspace.",
+            "If an Easytest setup is reserved or this option is specified then the",
+            "YANG catalog from the current workspace is used.",
+            "Otherwise a YANG catalog based on the current software in the DUT is used.",
+            "Use '--no-workspace' to always use the YANG catalog based on the current",
+            "software in the DUT.") do |o|
+        $opts[:workspace] = o
+    end
+
+end.parse!
+
+if $opts[:verbose]
+    puts "opts:"
+    pp $opts
+end
+
+raise "Missing device!" if $opts[:device].nil?
+raise "Missing method!" if $opts[:method].nil?
+
+################################################################################
+# Initialize handler
+################################################################################
+tracer = Tracer.new $opts[:sys_trace]
+dut = Et::Handler::Dut.new $opts[:device]
+m = Et::Handler::Mup1.new dut, tracer
+mon = Mup1Con.new m
+coap = Et::Handler::Coap.new m, tracer
+
+################################################################################
+# Process input if needed
+################################################################################
+input_format = nil
+input_data = nil
+if ['fetch', 'ipatch', 'put', 'post'].include?($opts[:method])
+    if $opts[:input_file].nil?
+        # Read from STDIN
+        if $opts[:input_format] == 'json'
+            input_data = JSON.parse(STDIN.read)
+        else
+            input_data = YAML.load(STDIN.read) # The default if input_format not specified
+        end
+    else
+        # Read from input file
+        input_format = $opts[:input_format] # 1. prio
+        input_format = $opts[:input_file].match(/(json|yaml)$/)&.to_s if input_format.nil? # 2. prio
+        input_format = 'yaml' if input_format.nil? # 3. prio
+        if input_format == 'yaml'
+            input_data = YAML.load(File.read($opts[:input_file]))
+        else
+            # Consider to always use YAML.load() as it can read JSON also
+            # https://stackoverflow.com/questions/24608600/is-it-safe-to-parse-json-with-yaml-load
+            input_data = JSON.parse(File.read($opts[:input_file]))
+        end
+    end
+    puts "input_format: #{input_format}" if $opts[:verbose]
+end
+
+################################################################################
+# Load relevant YANG schema
+################################################################################
+if $opts[:workspace] == true or ($opts[:workspace].nil? and $topology)
+    puts "Use schema based on current workspace" if $opts[:verbose]
+    s = yang_schema_get
+else
+    # Use schema based on checksum in DUT
+    checksum = fetch_yang_lib_checksum_from_dut(coap)
+    s = get_yang_schema(checksum)
+end
+
+################################################################################
+# Add query parameters to URL
+################################################################################
+url = "c"
+delim = "?"
+if $opts[:query].length > 0
+    if ['fetch', 'get'].include?($opts[:method])
+        $opts[:query].each do |q|
+            url << "#{delim}#{q}"
+            delim = "&"
+        end
+    else
+    raise "CoAP method #{$opts[:method]} does not support query parameters!"
+    end
+end
+puts "URL: #{url}" if $opts[:verbose]
+
+################################################################################
+# Run CoAP method
+################################################################################
+output_data = nil
+case $opts[:method]
+when 'fetch'
+    cbor_req = json_seq2cbor(s, input_data, $opts[:method])
+    res = coap.fetch(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_IDENTIFIERS_CBOR})
+    res.payload_rx
+    output_data = cbor_seq2json(s, CBOR.decode_seq(res.payload_rx), $opts[:method])
+when 'ipatch'
+    cbor_req = json_seq2cbor(s, input_data, $opts[:method])
+    res = coap.ipatch(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_INSTANCES_CBOR})
+    if res.payload_rx.length > 0
+        # Eventual output from iPATCH is an error message encoded in CBOR with content_type CT_APPL_YANG_DATA_CBOR
+        output_data = cbor_seq2json(s, CBOR.decode_seq(res.payload_rx), 'yang')
+    end
+when 'get'
+    res = coap.get(url)
+    output_data = cbor_seq2json(s, CBOR.decode_seq(res.payload_rx), $opts[:method])
+when 'put'
+    cbor_req = json_seq2cbor(s, input_data, $opts[:method])
+    res = coap.put(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_DATA_CBOR})
+when 'post'
+    cbor_req = json_seq2cbor(s, input_data, $opts[:method])
+    res = coap.post(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_INSTANCES_CBOR})
+    if res.payload_rx.length > 0
+        output_data = cbor_seq2json(s, CBOR.decode_seq(res.payload_rx), $opts[:method])
+    end
+when 'delete'
+    res = coap.del(url)
+else
+    raise "CoAP method #{$opts[:method]} not implemented!"
+end
+
+################################################################################
+# Process output
+################################################################################
+if output_data
+    output_format = nil
+    if $opts[:output_file].nil?
+        # Write to STDOUT
+        if $opts[:output_format] == 'json'
+            output_format = 'json'
+            STDOUT.puts(JSON.pretty_generate(output_data))
+        else
+            output_format = 'yaml'
+            STDOUT.puts(output_data.to_yaml) # The default if output_format not specified
+        end
+    else
+        # Write to output file
+        output_format = $opts[:output_format] # 1. prio
+        output_format = $opts[:output_file].match(/(json|yaml)$/)&.to_s if output_format.nil? # 2. prio
+        output_format = 'yaml' if output_format.nil? # 3. prio
+        if output_format == 'yaml'
+            File.write($opts[:output_file], output_data.to_yaml)
+        else
+            File.write($opts[:output_file], JSON.pretty_generate(output_data))
+        end
+    end
+    puts "output_format: #{output_format}" if $opts[:verbose]
+end

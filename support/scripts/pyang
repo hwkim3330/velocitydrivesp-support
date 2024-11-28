@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# Copyright (c) 2021-2022 Microchip Technology Inc. and its subsidiaries.
+# SPDX-License-Identifier: MIT
+
+# This is a wrapper script for the local 'pyang' utility.
+
+# Save current wd
+SAVED_DIR="$( pwd )"
+
+# Find the location of this script
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+
+# Change to local pyang dir
+PYANG_DIR="$SCRIPT_DIR/../pyang"
+cd "$PYANG_DIR"
+
+# Source the 'env.sh' script
+# Note that PATH is prepended here with '...support/pyang/bin'
+. ./env.sh
+
+# Go back where we came from
+cd "$SAVED_DIR"
+
+# Run the local 'pyang' in '...support/pyang/bin'
+pyang "$@"
