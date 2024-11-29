@@ -1,0 +1,162 @@
+= What is this
+
+VelocityDRIVE-SP is a SW platform capable of providing full firmware images for
+various Ethernet Switches. VelocityDRIVE-SP based firmware offers CoAP/CORECONF
+management server.
+
+The main purpose of this repository is to provide a set of scripts making it
+possible to interact with the CoAP/CORECONF management interface offered by
+VelocityDRIVE-SP.
+
+Beside from offering "vanilla" CoAP as defined by RFC7252, the firmware also
+offers a UART based protocol called MUP1 (Microchip Uart Protocol 1). MUP1 is a
+point-2-point protocol, which can among other things carry CoAP frames. This
+makes it possible to do CORECONF requests over IPv4 (as normal) or over MUP1.
+The advantage of MUP1 is that it can also be used when no IP address is
+configured, or no Ethernet connection is possible/desired.
+
+= Audience
+
+This repository is intended for SW Developers or HW designers working with
+VelocityDRIVE-SP. SW Developers may be creating alternative client SW,
+evaluating features, or working with CORECONF/RFC7951/RFC9254/RFC9595 and wants
+to leverage the conversion functions. HW designers may need to tailor a binary
+to a board.
+
+IMPORTANT: This is not the only client SW, for UI based and more end-user
+oriented client tool ask your Microchip support team about access to
+VelocityDRIVE-CT.
+
+= Usage of YAML/JSON/RFC7951 along with CORECONF
+
+Most of the tools in this repository uses the JSON/YAML encoding of YANG data as
+defined in RFC7951 as input/output format, and then converts this to CBOR when
+communicating with a CORECONF server.
+
+This format has been chosen for the following reasons:
+- The CBOR format used by CORECONF is binary, and even if converted to the
+  CBOR-Diag format, it is still using SID (numbers) instead of strings making it
+  hard to read/write.
+- It is an established standard used in RESTCONF which is also a YANG based
+  management interface.
+
+A "yang" catalog containing all relevant YANG models (including deviations) and
+SID files is required to perform such conversion. If using a tool which connects
+to a device, then the tool will start by reading out the SHA of the YANG catalog
+and the download it form [1]. If used in "offline" mode, then the yang-catalog
+must be provided manually.
+
+[1] http://mscc-ent-open-source.s3-website-eu-west-1.amazonaws.com/?prefix=public_root/velocitydrivesp/yang-by-sha/
+
+
+= What can I do with this
+
+The `support/scripts/` include a bunch of scripts making it easier to work with
+VelocityDRIVE-SP based firmware. Following is a brief walk through of some of
+the provided scripts:
+
+- `bc2cbor`: Convert YAML based board configuration files into CBOR. This is
+  used to tailor a binary to a given board.
+- `dbgreg`: Debug tool for accessing registers.
+- `mup1cc`: MUP1-Coreconf-Client. This tool can connect to a switch running
+  VelocityDRIVE-SP and perform iPatch/Fetch requests (and more) against the
+  running config datastore. All input/output are done in RFC7951 formant, and
+  on-the-fly converted to CBOR.
+- `mup1ct`: MUP1-Client-Tool. This tool can a switch running VelocityDRIVE-SP
+  and perform CoAP requests over MUP1. This tool will not do any conversion of
+  the payload which is useful to do firmware updates. It can also be used to
+  transfer CBOR data directly and thereby do COREOCNF requests, this is
+  how-ever not recommended in most cases.
+- `pyang`: This is a small wrapper to make it easier to call `pyang` with the
+  SID plugin enabled.
+- `yang-enc`: This tool can do various encoding/decoding of YANG data - most
+  important it can convert between RFC7951 and RFC9254 formats.
+
+
+= How to use it
+
+The easiest way to use the scripts provided in this repo is to use the provided
+Docker container and the `dr` script.
+
+The `dr` script is from: https://github.com/microchip-ung/docker-run which also
+offer a general introduction.
+
+To use it in this repository, copy the `dr` script into `/usr/local/bin` if you
+do not have it already:
+
+    $ sudo cp dr /usr/local/bin
+
+Then try use the `dr` script to run a script:
+
+    $ dr mup1cc --help
+
+If docker is working on your machine, and if you are a member of the docker
+group, then this should automatic pull the docker image configured in the
+`.docker.env` file and run the `./support/scripts/mup1cc --help` command.
+
+Next time the `dr` command is used, the docker image will be cached and it
+should be fast to do.
+
+== Access to UART in Docker
+
+The `.docker.env` will map uart devices if it can detect them, but it will run
+the command as a non-privileged user. It can therefore be necessary to change
+the permissions of the uart device:
+
+    $ chmod 666 /dev/ttyACM0
+
+= Examples
+
+    # Get and show running configuration:
+    $ dr mup1cc -d /dev/ttyACM0 -q c=c -m get
+
+    # Get and status
+    $ dr mup1cc -d /dev/ttyACM0 -m get
+
+    # Create a L3/VLAN interface and assign an IP address
+    # Ignore the schema errors printed by the mup1cc command - these are known
+    # errors in the schema, the command will work anyway.
+    cat <<-EOF > ipatch-req-set-ip.yaml
+    - ? "/ietf-interfaces:interfaces/interface[name='L3V1']"
+      : name: "L3V1"
+        ietf-ip:ipv4:
+          address:
+          - ip: "10.0.0.1"
+            prefix-length: 24
+    EOF
+    $ dr mup1cc -d /dev/ttyACM0 -m ipatch -i ipatch-req-set-ip.yaml
+
+    # Change the security-mode of the IP/CoAP server to no-sec (disable DTLS).
+    # (Not recommended in production - but useful doing development)
+    $ cat <<-EOF > ipatch-req-no-sec.yaml
+    - "/mchp-velocitysp-system:coap-server/config/security-mode": "no-sec"
+    EOF
+    $ dr mup1cc -d /dev/ttyACM0 -m ipatch -i ipatch-req-no-sec.yaml
+
+
+    # Get interface config and status for port 1 and 2:
+    $ cat <<-EOF > fetch-req-port-get.yaml
+    - "/ietf-interfaces:interfaces/interface[name='1']"
+    - "/ietf-interfaces:interfaces/interface[name='2']"
+    EOF
+    dr mup1cc -d /dev/ttyACM0 -m fetch -i fetch-req-port-get.yaml
+
+
+= Useful links
+
+- Microchip/VelocityDRIVE press release: https://www.microchip.com/en-us/about/news-releases/products/new-velocitydrive-software-platform-and-automotive-qualified
+- Microchip/VelocityDRIVE-SP web page: https://www.microchip.com/en-us/software-library/velocitydrive-sp
+- CORECONF: https://datatracker.ietf.org/doc/draft-ietf-core-comi/
+- RFC7252 The Constrained Application Protocol (CoAP): https://datatracker.ietf.org/doc/rfc7252/
+- RFC7951 JSON Encoding of Data Modeled with YANG: https://datatracker.ietf.org/doc/rfc7951/
+- RFC9254 Encoding of Data Modeled with YANG in the Concise Binary Object Representation (CBOR): https://datatracker.ietf.org/doc/rfc9254/
+- RFC9595 YANG Schema Item iDentifier (YANG SID): https://datatracker.ietf.org/doc/rfc9595/
+
+
+= Just for publishing
+
+This repository is currently only being used to publish selected scripts from a
+non-public upstream repository. This means that pull-requests are not accepted,
+and the git-log is not really use full as it is mostly just "import-commits"
+where the support-folder is copied from the upstream repo to this.
+
