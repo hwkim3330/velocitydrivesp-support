@@ -65,7 +65,7 @@ the provided scripts:
 - `mup1ct`: MUP1-Client-Tool. This tool can a switch running VelocityDRIVE-SP
   and perform CoAP requests over MUP1. This tool will not do any conversion of
   the payload which is useful to do firmware updates. It can also be used to
-  transfer CBOR data directly and thereby do COREOCNF requests, this is
+  transfer CBOR data directly and thereby do CORECONF requests, this is
   how-ever not recommended in most cases.
 - `pyang`: This is a small wrapper to make it easier to call `pyang` with the
   SID plugin enabled.
