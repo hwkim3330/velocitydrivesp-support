@@ -141,6 +141,13 @@ the permissions of the uart device:
     EOF
     dr mup1cc -d /dev/ttyACM0 -m fetch -i fetch-req-port-get.yaml
 
+    # Save running config:
+    $ cat <<-EOF > rpc-req-save-running.yaml
+    - "/mchp-velocitysp-system:save-config":
+    EOF
+    dr mup1cc -d /dev/ttyACM0 -m post -i rpc-req-save-running.yaml
+
+
 
 = Useful links
 
