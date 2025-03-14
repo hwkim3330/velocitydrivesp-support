@@ -655,7 +655,11 @@ class SidFile:
                 self.collect_inner_data_nodes([statement])
 
             elif statement.keyword == 'uses':
-                prefix = self.get_path(statement.parent)
+                if statement.parent.keyword == 'augment':
+                    prefix = self.get_path(statement.parent.i_target_node)
+                else:
+                    prefix = self.get_path(statement.parent)
+
                 self.collect_inner_data_nodes(statement.i_grouping.i_children, prefix)
                 self.collect_in_substmts(statement.substmts)
 
@@ -663,11 +667,37 @@ class SidFile:
                 self.collect_in_substmts(statement.substmts)
 
     def get_path(self, statement, prefix=""):
+        # When a 'grouping' is expanded via a 'uses' statement then all nodes
+        # must be assigned the namespace of the current module.
+        # update_path() updates the path to contain the namespace at the
+        # beginning unless it is already assigned in either prefix or path.
+        def update_path(self, prefix, path):
+            match = re.findall(r'\/([-\w]+):', prefix)
+            # Check prefix
+            if (match and match[-1] == self.module_name):
+                # Do nothing - namespace is already assigned in prefix
+                return path
+
+            # Check path
+            match = re.match(r'\/([-\w]+):', path)
+            if match:
+                if (match.group(1) == self.module_name):
+                    # Do nothing - namespace is already assigned in path
+                    return path
+                else:
+                    # Update wrong namespace in path
+                    return re.sub(r'^\/([-\w]+):', f"/{self.module_name}:", path)
+            else:
+                # Add namespace in path
+                return path.replace("/", f"/{self.module_name}:", 1)
+
         path = ""
+        grouping = False
 
         while statement.i_module is not None:
-            if (statement.keyword not in self.grouping_keywords
-                    and not self.has_yang_data_extension(statement)):
+            if (statement.keyword in self.grouping_keywords):
+                grouping = True
+            elif (not self.has_yang_data_extension(statement)):
                 # Locate the data node parent
                 parent = statement.parent
                 while parent.i_module is not None:
@@ -682,6 +712,9 @@ class SidFile:
                     path = "/" + statement.i_module.arg + ":" + statement.arg + path
 
             statement = statement.parent
+
+        if (grouping):
+            path = update_path(self, prefix, path)
 
         return prefix + path
 

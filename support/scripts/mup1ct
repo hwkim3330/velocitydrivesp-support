@@ -970,9 +970,10 @@ class MUP1
 
   def poll_input timeout = nil
     timeout = @timeout if not timeout
-    rs, ws = IO.select([@stream], [], [], timeout)
-    if rs != nil and r = rs[0]
-      r.read_nonblock(512).unpack("C*").each do |c|
+    rs = IO.select([@stream], [], [], timeout)
+    return if rs.nil?
+    if rs[0][0]
+      rs[0][0].read_nonblock(512).unpack("C*").each do |c|
         mup1_rx_sm c
       end
     end
@@ -1122,6 +1123,7 @@ class MUP1
   end
 
   def write s
+    puts s
     @stream.write s
     @stream.flush
   end
@@ -1219,8 +1221,23 @@ end
 
 # Open socket to serial line
 term = URI($device)
-sock = TCPSocket.open(term.host, term.port)
-sport = sock.addr[1]
+sock = nil
+sport = 123
+if term.scheme.nil?
+  require "serialport"
+  puts "Opening serial port at #{$device}"
+  conf = {
+    "baud"      => 115200,
+    "data_bits" => 8,
+    "stop_bits" => 1,
+    "parity"    => SerialPort::NONE
+  }
+  sock = SerialPort.new($device, conf)
+  sock.flow_control = SerialPort::NONE
+else
+  sock = TCPSocket.open(term.host, term.port)
+  sport = sock.addr[1]
+end
 $mup1 = MUP1.new("easytest", sock)
 
 if ($cmd == "coap")

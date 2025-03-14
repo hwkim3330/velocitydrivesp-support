@@ -35,7 +35,7 @@ Options:
                              Ex: termhub://10.0.0.2:4000
 
 Command details:
-  dbgreg [options] miim|sw [(c22|c45)] (rd|wr)  (<PORT>[:<MMD>]:<REG_ADDR>[=VAL])...
+  dbgreg [options] miim|sw [(c22|c45)] (<PORT>[:<MMD>]:<REG_ADDR>[=VAL])...
   Do a MIIM or Switch read or write request
 USAGE
 
@@ -172,10 +172,8 @@ else
     fields = []
     f = "#{LM_DBG_REG_FIELDS_TYPE}:"
     if r[:reg] && r[:val]
-        puts "1"
       f += LM_DBG_REG_TYPE_SWITCH_WR.to_s
     elsif r[:reg]
-        puts "2"
       f += LM_DBG_REG_TYPE_SWITCH_RD.to_s
     else
       raise "Ehhh...."
@@ -186,7 +184,7 @@ else
     "{#{fields.join(",")}}"
   end
   diag = "[#{req.join(",")}]"
-  pp diag
+#  pp diag
   parser = CBOR_DIAGParser.new
   diag_ = parser.parse diag
   cbor = CBOR::encode(diag_.to_rb)

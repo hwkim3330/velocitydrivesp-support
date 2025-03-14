@@ -261,32 +261,60 @@ end
 RSpec.describe 'json_seq2cbor and cbor_seq2json' do
     include_context 'yang catalog'
 
-    it "convert FETCH request" do
+    it "check fetch-req.yaml <-> fetch-req.cbor" do
         yaml = YAML.load(File.read(File.join(__dir__, 'tests', 'fetch-req.yaml')))
         cbor = File.binread(File.join(__dir__, 'tests', 'fetch-req.cbor'))
         expect(json_seq2cbor(yang_schema, yaml, 'fetch')).to eq cbor
         expect(cbor_seq2json(yang_schema, CBOR.decode_seq(cbor), 'fetch')).to eq yaml
     end
 
-    it "convert YAML FETCH response to CBOR" do
+    it "check fetch-res.yaml <-> fetch-res.cbor" do
         yaml = YAML.load(File.read(File.join(__dir__, 'tests', 'fetch-res.yaml')))
         cbor = File.binread(File.join(__dir__, 'tests', 'fetch-res.cbor'))
         expect(json_seq2cbor(yang_schema, yaml, 'fetch')).to eq cbor
         expect(cbor_seq2json(yang_schema, CBOR.decode_seq(cbor), 'fetch')).to eq yaml
     end
 
-    it "convert YAML iPATCH request to CBOR" do
+    it "check fetch-req-port-get.yaml <-> fetch-req-port-get.cbor" do
+        yaml = YAML.load(File.read(File.join(__dir__, 'tests', 'fetch-req-port-get.yaml')))
+        cbor = File.binread(File.join(__dir__, 'tests', 'fetch-req-port-get.cbor'))
+        expect(json_seq2cbor(yang_schema, yaml, 'fetch')).to eq cbor
+        expect(cbor_seq2json(yang_schema, CBOR.decode_seq(cbor), 'fetch')).to eq yaml
+    end
+
+    it "check fetch-resp-port-get.yaml <-> fetch-resp-port-get.cbor" do
+        yaml = YAML.load(File.read(File.join(__dir__, 'tests', 'fetch-resp-port-get.yaml')))
+        cbor = File.binread(File.join(__dir__, 'tests', 'fetch-resp-port-get.cbor'))
+        expect(json_seq2cbor(yang_schema, yaml, 'fetch')).to eq cbor
+        expect(cbor_seq2json(yang_schema, CBOR.decode_seq(cbor), 'fetch')).to eq yaml
+    end
+
+    it "check ipatch-req.yaml <-> ipatch-req.cbor" do
         yaml = YAML.load(File.read(File.join(__dir__, 'tests', 'ipatch-req.yaml')))
         cbor = File.binread(File.join(__dir__, 'tests', 'ipatch-req.cbor'))
         expect(json_seq2cbor(yang_schema, yaml, 'ipatch')).to eq cbor
         expect(cbor_seq2json(yang_schema, CBOR.decode_seq(cbor), 'ipatch')).to eq yaml
     end
 
-    it "convert YAML POST request to CBOR" do
+    it "check ipatch-req-set-ip.yaml <-> ipatch-req-set-ip.cbor" do
+        yaml = YAML.load(File.read(File.join(__dir__, 'tests', 'ipatch-req-set-ip.yaml')))
+        cbor = File.binread(File.join(__dir__, 'tests', 'ipatch-req-set-ip.cbor'))
+        expect(json_seq2cbor(yang_schema, yaml, 'ipatch')).to eq cbor
+        expect(cbor_seq2json(yang_schema, CBOR.decode_seq(cbor), 'ipatch')).to eq yaml
+    end
+
+    it "check post-req.yaml <-> post-req.cbor" do
         yaml = YAML.load(File.read(File.join(__dir__, 'tests', 'post-req.yaml')))
         cbor = File.binread(File.join(__dir__, 'tests', 'post-req.cbor'))
         expect(json_seq2cbor(yang_schema, yaml, 'post')).to eq cbor
         expect(cbor_seq2json(yang_schema, CBOR.decode_seq(cbor), 'post')).to eq yaml
     end
 
+    it "check ipatch-port-speed.yaml <-> ipatch-port-speed.cbor" do
+        yaml = YAML.load(File.read(File.join(__dir__, 'tests', 'ipatch-port-speed.yaml')))
+        cbor = File.binread(File.join(__dir__, 'tests', 'ipatch-port-speed.cbor'))
+        yaml_canonical = cbor_seq2json(yang_schema, CBOR.decode_seq(cbor), 'ipatch')
+        expect(json_seq2cbor(yang_schema, yaml_canonical, 'ipatch')).to eq cbor
+        expect(json_seq2cbor(yang_schema, yaml, 'ipatch')).to eq cbor
+    end
 end

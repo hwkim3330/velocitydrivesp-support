@@ -4,10 +4,14 @@
 require 'nokogiri'
 require 'json'
 require 'bigdecimal'
+require 'tsort'
 
 module Yang
 
 class ModuleSet
+    attr_reader :modules
+    include TSort
+
     def initialize
         @modules = {}
     end
@@ -24,6 +28,12 @@ class ModuleSet
         return self
     end
 
+    def ast_clear
+      @modules.each do |k, v|
+        v.ast = nil
+      end
+    end
+
     def add_sid_file(path)
         sid_file = JSON.parse(File.read(path))
         src_mod = find_module(sid_file['module-name'])
@@ -33,42 +43,8 @@ class ModuleSet
                 m = find_module(item['identifier'])
                 m.schema.sid = item['sid'] if m
             elsif item['namespace'] == 'data'
-                # Horrible hack to work around pyang bug in SID identifiers.
-                # Should be removed when pyang conforms to ietf-core-sid-24.
-                # TODO: this should be verified for correctness
-                mod_prefix  = nil
-                prev_prefix = nil
-                dst_mod     = nil
-                schema_path = []
-                item['identifier'][1..].split('/').each do |name|
-                    if name =~ /(.+):(.*)/
-                        if find_module($1)
-                            mod_prefix = $1
-
-                            if !$2.empty?
-                                schema_path << name
-                                dst_mod = find_module($1) if dst_mod.nil?
-                            end
-                        else
-                            m = src_mod.resolve_prefix($1, self)
-                            dst_mod = m if dst_mod.nil?
-
-                            if prev_prefix != $1
-                                schema_path << "#{m.name}:#{$2}" if not $2.empty?
-                            else
-                                schema_path << $2 if not $2.empty?
-                            end
-                        end
-
-                        prev_prefix = $1
-                    elsif prev_prefix != mod_prefix
-                        schema_path << "#{mod_prefix}:#{name}"
-                        prev_prefix = mod_prefix
-                    else
-                        schema_path << name
-                    end
-                end
-
+                schema_path = item['identifier'][1..].split('/')
+                dst_mod = find_module(schema_path[0].split(':').first)
                 target = dst_mod.schema.resolve_schema_path(schema_path)
                 target.sid = item['sid'] if target
             elsif item['namespace'] == 'identity'
@@ -84,37 +60,19 @@ class ModuleSet
         @modules[name]
     end
 
+    def tsort_each_node &block
+      @modules.each_value(&block)
+    end
+
+    def tsort_each_child node, &block
+      @modules.each_value.select{|c| node.imports? c}.each(&block)
+    end
+
     def schema
-        def P(m1, m2)
-            if m1.imports? m2
-                1
-            elsif m2.imports? m1
-                -1
-            else
-                0
-            end
-        end
-
-        def sort(a)
-            for i in 0...a.size do
-                for j in i+1...a.size do
-                    a[i], a[j] = a[j], a[i] if P(a[i], a[j]) > 0
-                end
-            end
-            a
-        end
-
         # Topologically sort module dependency graph.
         # This ensures that we have processed module A before any modules that augment into A.
         # There are no cycles in the dependency graph. See RFC 7950 section 5.1.
-        sorted = sort(@modules.values)
-        for i in 0...sorted.size do
-            for j in i+1...sorted.size do
-                p = P(sorted[i], sorted[j])
-                puts "P(#{sorted[i].name}, #{sorted[j].name}) = #{p}" if p > 0
-            end
-        end
-
+        sorted = self.tsort
         sorted.each {|mod| mod.interpret(self)}
         sorted.each do |mod| # TODO: rewrite interpret into a pure function that threads a context to handle deviations and augments
             mod.ast.css('> deviation').each do |deviation|
@@ -153,7 +111,8 @@ class ModuleSet
 end
 
 class Module
-    attr_reader :ast, :schema, :identity
+    attr_accessor :ast
+    attr_reader :schema, :identity
 
     def initialize(ast)
         @ast = ast

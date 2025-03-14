@@ -149,7 +149,8 @@ def get_device
     return nil
 end
 
-$opts = {:device => get_device,
+$opts = {:continue_on_error => false,
+         :device => get_device,
          :query => [],
         } # Add more default options here
 
@@ -159,6 +160,10 @@ OptionParser.new do |opts|
     opts.on("-h", "--help", "The MUP1CC help") do |o|
         puts opts
         exit
+    end
+
+    opts.on("-c", "--continue", "Continue on errors in JSON schema validation.") do
+        $opts[:continue_on_error] = true
     end
 
     opts.on("-d", "--device URL", "IP based terminal device to connect to.",
@@ -301,12 +306,11 @@ puts "URL: #{url}" if $opts[:verbose]
 output_data = nil
 case $opts[:method]
 when 'fetch'
-    cbor_req = json_seq2cbor(s, input_data, $opts[:method])
+    cbor_req = json_seq2cbor(s, input_data, $opts[:method], $opts[:continue_on_error])
     res = coap.fetch(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_IDENTIFIERS_CBOR})
-    res.payload_rx
     output_data = cbor_seq2json(s, CBOR.decode_seq(res.payload_rx), $opts[:method])
 when 'ipatch'
-    cbor_req = json_seq2cbor(s, input_data, $opts[:method])
+    cbor_req = json_seq2cbor(s, input_data, $opts[:method], $opts[:continue_on_error])
     res = coap.ipatch(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_INSTANCES_CBOR})
     if res.payload_rx.length > 0
         # Eventual output from iPATCH is an error message encoded in CBOR with content_type CT_APPL_YANG_DATA_CBOR
@@ -316,10 +320,10 @@ when 'get'
     res = coap.get(url)
     output_data = cbor_seq2json(s, CBOR.decode_seq(res.payload_rx), $opts[:method])
 when 'put'
-    cbor_req = json_seq2cbor(s, input_data, $opts[:method])
+    cbor_req = json_seq2cbor(s, input_data, $opts[:method], $opts[:continue_on_error])
     res = coap.put(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_DATA_CBOR})
 when 'post'
-    cbor_req = json_seq2cbor(s, input_data, $opts[:method])
+    cbor_req = json_seq2cbor(s, input_data, $opts[:method], $opts[:continue_on_error])
     res = coap.post(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_INSTANCES_CBOR})
     if res.payload_rx.length > 0
         output_data = cbor_seq2json(s, CBOR.decode_seq(res.payload_rx), $opts[:method])
@@ -330,10 +334,14 @@ else
     raise "CoAP method #{$opts[:method]} not implemented!"
 end
 
+if res.code_class != 2
+    STDOUT.printf("ERROR: response code %d.%02d\n", res.code_class, res.code_detail)
+end
+
 ################################################################################
 # Process output
 ################################################################################
-if output_data
+if output_data and output_data.any?
     output_format = nil
     if $opts[:output_file].nil?
         # Write to STDOUT

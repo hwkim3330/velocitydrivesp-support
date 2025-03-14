@@ -5,7 +5,7 @@
 
 require_relative "../yang-enc/yang-schema.rb"
 require_relative "../yang-enc/yang-enc.rb"
-require 'base64'
+require 'yaml'
 require 'pp'
 
 def main
@@ -16,6 +16,8 @@ def main
   # top is now the absolute repository root
 
   bc = []
+  cmd = nil
+  ext = nil
 
   opt_parser = OptionParser.new do |opts|
     opts.banner = """Usage: bc2cbor [options]
@@ -28,23 +30,70 @@ def main
       puts opts
       exit
     end
-    opts.on("-b FILE", "--board-config FILE", "Board config file") do |f|
+
+    opts.on("-b FILE", "--board-config FILE", "Board config file (if repeated then files will be merged)") do |f|
       bc << YAML.load_file(f)
+    end
+
+    opts.on("-e FILE", "--extension-module FILE", "Extension module binary") do |f|
+      ext = YAML.load_file(f)
+    end
+
+    opts.on("-c", "--check-only", "Just do the schema-check (no conversion)") do |f|
+      exclusive_opts_error() if cmd
+      cmd = :only_check
+    end
+
+    opts.on("-d", "--dump-merged-board-config", "Dump the merged boardconfig in YAML format") do |f|
+      exclusive_opts_error() if cmd
+      cmd = :dump_merged
+    end
+
+    opts.on("-s", "--schema-dump", "Dump the JSON schema to stdout") do |f|
+      exclusive_opts_error() if cmd
+      cmd = :schema_dump
     end
   end
 
   opt_parser.parse!(ARGV)
 
   bc = bc.reduce(&method(:merge_hashes))
-  abort("No input") if bc.nil?
+  abort("No input") if bc.nil? and cmd != :schema_dump
+
+  if ext
+    bc["board:extmod"] = {} if bc["board:extmod"].nil?
+    bc["board:extmod"]["text"] = ext["text"]
+    bc["board:extmod"]["data_offset"] = ext["data_offset"]
+  end
 
   bc_schema = generate_yang_schema("#{top}/docs/sw_refs/yang",
                                    ["#{top}/docs/sw_refs/yang/board.yang"],
-                                   ["#{top}/docs/sw_refs/yang/board@2024-12-31.sid"])
-  bc_cbor = json_seq2cbor(bc_schema, bc, 'yang')
+                                   ["#{top}/docs/sw_refs/yang/board@2025-03-31.sid"])
+  json_schema = to_json_schema(bc_schema, 'yang')
+  schemer = JSONSchemer.schema(json_schema)
 
-  STDOUT.binmode
-  STDOUT.write(bc_cbor)
+  case cmd
+  when :schema_dump
+    puts JSON.pretty_generate(json_schema)
+
+  when :dump_merged
+    puts bc.to_yaml
+
+  when :only_check
+    valid = true
+    errmsg = schemer.validate(bc).map{|e| JSONSchemer::Errors.pretty(e)}
+    if errmsg.size == 0
+      puts "Schema check: Passed"
+    else
+      puts "Schema check: Failed"
+      puts errmsg.join("\n")
+    end
+
+  else
+    bc_cbor = json_seq2cbor(bc_schema, bc, 'yang')
+    STDOUT.binmode
+    STDOUT.write(bc_cbor)
+  end
 end
 
 def merge_hashes a, b
@@ -64,6 +113,11 @@ def merge_hashes a, b
     end
   end
   return a
+end
+
+def exclusive_opts_error
+  puts "Options: -c, -d and -s are mutually exclusive!"
+  exit 1
 end
 
 main if $0 == __FILE__
