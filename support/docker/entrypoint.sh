@@ -46,11 +46,13 @@ fi
 unset IFS
 
 if [[ "$#" -eq "0" ]]; then
-    exec runuser --pty "$BLD_USER" --command="cat"
+    if [ -e /dev/ttyACM0 ]; then
+        echo "▶ Starting FastAPI GUI as $BLD_USER"
+        exec runuser --pty "$BLD_USER" --command="python3 /workspace/web/main.py"
+    else
+        exec runuser --pty "$BLD_USER" --command="cat"
+    fi
 else
-    # Run command as user.
-    # Create pseudo-terminal for better security on interactive sessions.
-    # Note that "$*" is used here to put all parameter into a single string.
     exec runuser --pty "$BLD_USER" --command="$*"
 fi
 
