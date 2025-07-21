@@ -48,6 +48,7 @@ RUN adduser --no-create-home --disabled-password --home /mapped_home --uid 1000 
 
 RUN apt-get install -y python3 python3-pip
 RUN apt-get install -y python3-lxml
+RUN pip install fastapi uvicorn pyyaml
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 100
 
 # A common entrypoint for setting up things before running the user command(s)
