@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""
-VelocityDRIVE‑SP ‑ FastAPI “all‑in‑one” server
-
-* 위치:  velocitydrive-sp/web/main.py
-* HTML / JS 프론트엔드도 여기에 문자열로 포함
-* 의존 패키지 (requirements.txt)
-    fastapi
-    uvicorn
-    pyyaml      # YAML→JSON 변환용
-"""
-
 import os
 import subprocess
 import tempfile
@@ -34,7 +22,7 @@ app.add_middleware(
 )
 
 # ──────────────────────────────────────────────────────────────
-# 인라인 HTML (React/Vue 없이 순수 JS fetch 사용, 필요 시 교체 가능)
+# 인라인 HTML (순수 JS fetch 사용)
 # ──────────────────────────────────────────────────────────────
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -90,7 +78,6 @@ HTML_PAGE = """
         const res = await fetch('/api/run-mup1cc', {method:'POST', body:data});
         const txt = await res.text();
         try {
-          // pretty‑print JSON if possible
           const js = JSON.parse(txt);
           log.textContent = JSON.stringify(js, null, 2);
         } catch { log.textContent = txt; }
@@ -110,9 +97,8 @@ HTML_PAGE = """
 async def root():
     return HTML_PAGE
 
-
 # ──────────────────────────────────────────────────────────────
-# 핵심 API: 기존 dr mup1cc 래핑
+# 핵심 API: dr mup1cc 래핑
 # ──────────────────────────────────────────────────────────────
 @app.post("/api/run-mup1cc")
 async def run_mup1cc(
@@ -120,14 +106,8 @@ async def run_mup1cc(
     device: str = Form(...),
     input_file: Optional[UploadFile] = File(None),
 ):
-    """
-    · method : fetch / get / ipatch / post / put / delete …
-    · device : /dev/ttyACM0  또는  termhub://10.0.0.2:4000
-    · input_file : YAML 내용 (선택)
-    """
     temp_path: Path | None = None
     try:
-        # (1) 업로드 파일이 있다면 임시 저장
         if input_file:
             suffix = Path(input_file.filename or "input").suffix or ".yaml"
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
@@ -135,28 +115,23 @@ async def run_mup1cc(
             tmp.write(await input_file.read())
             tmp.close()
 
-        # (2) dr mup1cc 명령어 구성
         cmd = ["dr", "mup1cc", "-d", device, "-m", method]
         if temp_path:
             cmd += ["-i", str(temp_path)]
 
-        # (3) 실행
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
 
-        # (4) 오류 코드 처리
         if proc.returncode != 0:
             return JSONResponse(
                 status_code=500,
                 content={"error": proc.stderr.strip() or "mup1cc failed"},
             )
 
-        # (5) YAML → JSON 변환 시도
         stdout = proc.stdout.strip()
         try:
-            parsed = yaml.safe_load(stdout)  # YAML or JSON 가능
+            parsed = yaml.safe_load(stdout)
             return {"output": parsed}
         except Exception:
-            # YAML 아님 – 그대로 반환
             return {"output_raw": stdout}
 
     except subprocess.TimeoutExpired:
@@ -164,15 +139,12 @@ async def run_mup1cc(
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
     finally:
-        # (6) 임시 파일 정리
         if temp_path and temp_path.exists():
             temp_path.unlink()
 
-
 # ──────────────────────────────────────────────────────────────
-# 서버 실행 도우미 (python main.py 직접 실행 시)
+# 로컬 실행용
 # ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
