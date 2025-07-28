@@ -46,24 +46,28 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y \
 # Create default user for Jenkins compatibility
 RUN adduser --no-create-home --disabled-password --home /mapped_home --uid 1000 --gecos "Bob the Builder" jenkins > /dev/null
 
-# Install Python 3, pip, and lxml
+# Install Python 3 and pip
 RUN apt-get install -y python3 python3-pip python3-lxml \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3 100
 
-# Install FastAPI and related Python packages
-RUN pip3 install --no-cache-dir fastapi uvicorn Jinja2 python-multipart
+# Install Python dependencies via requirements.txt
+COPY requirements.txt /app/requirements.txt
+RUN pip3 install --no-cache-dir -r /app/requirements.txt
+
+# Install FastAPI and related Python packages (fallback)
+# RUN pip3 install --no-cache-dir fastapi uvicorn pyyaml python-multipart
 
 # Copy entrypoint for environment setup and command routing
-COPY ./entrypoint.sh /entrypoint.sh
+COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Set working directory for the FastAPI app
 WORKDIR /app
 
-# Copy FastAPI server code and static assets
+# Copy FastAPI server code
 COPY main.py /app/
-COPY main.html /app/
-COPY static/ /app/static/
+
+# Remove dedicated HTML/static copy: inline HTML in main.py
 
 # Expose FastAPI port
 EXPOSE 8000
